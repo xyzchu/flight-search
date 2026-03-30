@@ -113,18 +113,10 @@ async function runJob(page, job) {
   const runId = `run_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
   const { shift_start = 0, shift_end = 4, shift_step_days = 7 } = job;
 
-  // If travel_start_date is set, calculate base offset from original URL dates
-  let baseOffset = 0;
-  if (job.travel_start_date && job.base_dates?.length) {
-    const travelStart = new Date(job.travel_start_date + 'T00:00:00Z');
-    const firstBase = new Date(job.base_dates[0] + 'T00:00:00Z');
-    baseOffset = Math.round((travelStart - firstBase) / 86400000);
-  }
-
-  log(`  Job: "${job.name}" | Shifts ${shift_start}→${shift_end} × ${shift_step_days}d${baseOffset ? ` | Base offset: ${baseOffset}d` : ''}`);
+  log(`  Job: "${job.name}" | Shifts ${shift_start}→${shift_end} × ${shift_step_days}d`);
 
   for (let i = shift_start; i <= shift_end; i++) {
-    const days = baseOffset + (i * shift_step_days);
+    const days = i * shift_step_days;
     const { url: shiftedUrl, shiftedDates } = shiftUrl(job.base_url, days);
 
     log(`    Shift +${i} (+${days}d): ${shiftedDates.join(' / ')}`);
@@ -175,7 +167,8 @@ async function runJob(page, job) {
       });
     }
 
-    const wait = 15000 + Math.random() * 15000;
+    // Random delay between shifts
+    const wait = 15000 + Math.random() * 15000;  // 15-30s
     log(`      Waiting ${Math.round(wait / 1000)}s...`);
     await delay(wait);
   }

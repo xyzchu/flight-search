@@ -84,38 +84,6 @@ const timeUntil = (d) => {
   return `in ${Math.floor(h / 24)}d`
 }
 
-/* ─────── TRAVEL START DATE HELPERS ─────── */
-function getTravelStartDate(mode, customDate) {
-  switch (mode) {
-    case '2weeks': {
-      const d = new Date()
-      d.setDate(d.getDate() + 14)
-      return d.toISOString().slice(0, 10)
-    }
-    case '1month': {
-      const d = new Date()
-      d.setDate(d.getDate() + 30)
-      return d.toISOString().slice(0, 10)
-    }
-    case 'custom':
-      return customDate || null
-    default:
-      return null
-  }
-}
-
-function adjustBaseDates(baseDates, travelStartDate) {
-  if (!travelStartDate || !baseDates?.length) return baseDates
-  const first = new Date(baseDates[0] + 'T00:00:00')
-  const target = new Date(travelStartDate + 'T00:00:00')
-  const offset = Math.round((target - first) / 86400000)
-  return baseDates.map(d => {
-    const dt = new Date(d + 'T00:00:00')
-    dt.setDate(dt.getDate() + offset)
-    return dt.toISOString().slice(0, 10)
-  })
-}
-
 /* ─────── URL PARSER — v4 (handles KG-encoded airports) ─────── */
 function parseFlightUrl(url) {
   try {
@@ -129,6 +97,7 @@ function parseFlightUrl(url) {
     const bytes = new Uint8Array(bin.length)
     for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i)
 
+    // 1. Find all YYYY-MM-DD dates
     const dates = []
     const dateRe = /^\d{4}-\d{2}-\d{2}$/
     for (let j = 0; j <= bytes.length - 10; j++) {
@@ -138,6 +107,7 @@ function parseFlightUrl(url) {
     }
     if (!dates.length) return null
 
+    // 2. Find all known IATA codes (boundary-checked)
     const known = new Set(AIRPORTS.map(a => a.code))
     const allCodes = []
     for (let j = 0; j <= bytes.length - 3; j++) {
@@ -153,10 +123,13 @@ function parseFlightUrl(url) {
       }
     }
 
+    // 3. Group codes by leg: each leg's airports appear AFTER its date, before next date
+    //    (In the protobuf, each leg sub-message has: date → origin → destination)
     const legs = dates.map((d, i) => {
       const segStart = d.index + 10
       const segEnd = i + 1 < dates.length ? dates[i + 1].index : bytes.length
       const segCodes = allCodes.filter(c => c.index >= segStart && c.index < segEnd)
+      // Deduplicate consecutive
       const unique = []
       for (const c of segCodes) {
         if (!unique.length || c.code !== unique[unique.length - 1]) unique.push(c.code)
@@ -168,12 +141,15 @@ function parseFlightUrl(url) {
       }
     })
 
+    // 4. Chain inference: fill missing origin from previous leg's destination
     for (let i = 1; i < legs.length; i++) {
       if (!legs[i].from && legs[i].to && legs[i - 1].to) {
         legs[i].from = legs[i - 1].to
       }
     }
 
+    // 5. Round-trip heuristic: if first leg's origin still missing,
+    //    use last leg's destination (covers BNE→...→BNE pattern)
     if (!legs[0].from && legs[0].to && legs.length > 1 && legs[legs.length - 1].to) {
       legs[0].from = legs[legs.length - 1].to
     }
@@ -226,15 +202,11 @@ export default function FlightSearchApp({ session }) {
   const [fSchedDays, setFSchedDays] = useState(1)
   const [fStopDate, setFStopDate] = useState('')
   const [fOneOff, setFOneOff] = useState(false)
-  const [fStartMode, setFStartMode] = useState('url')
-  const [fTravelStart, setFTravelStart] = useState('')
-  const [fHasEndDate, setFHasEndDate] = useState(true)
 
   // Edit
   const [editingId, setEditingId] = useState(null)
   const [eFields, setEFields] = useState({})
   const [eSaving, setESaving] = useState(false)
-  const [eUrlParsed, setEUrlParsed] = useState(null)
 
   // Results
   const [selSearchId, setSelSearchId] = useState(null)
@@ -259,7 +231,7 @@ export default function FlightSearchApp({ session }) {
 
   useEffect(() => { loadSearches() }, [loadSearches])
 
-  /* ── Parse URL on change (add form) ── */
+  /* ── Parse URL on change ── */
   useEffect(() => {
     if (!fUrl.trim()) { setFParsed(null); return }
     const p = parseFlightUrl(fUrl.trim())
@@ -268,46 +240,13 @@ export default function FlightSearchApp({ session }) {
       const codes = p.legs.map(l => l.from)
       codes.push(p.legs[p.legs.length - 1].to)
       setFName(codes.join('-'))
+      if (p.dates.length) {
+        const first = new Date(p.dates[0])
+        first.setDate(first.getDate() - 7)
+        setFStopDate(first.toISOString().slice(0, 10))
+      }
     }
   }, [fUrl])
-
-  /* ── Auto stop date when parsed or travel start changes (add form) ── */
-  useEffect(() => {
-    if (!fParsed?.dates?.length || !fHasEndDate || fOneOff) return
-    const tsd = getTravelStartDate(fStartMode, fTravelStart)
-    const adjusted = adjustBaseDates(fParsed.dates, tsd)
-    if (adjusted?.length) {
-      const first = new Date(adjusted[0])
-      first.setDate(first.getDate() - 7)
-      setFStopDate(first.toISOString().slice(0, 10))
-    }
-  }, [fParsed, fStartMode, fTravelStart, fHasEndDate, fOneOff])
-
-  /* ── Adjusted base dates (add form) ── */
-  const adjustedBaseDates = useMemo(() => {
-    if (!fParsed?.dates?.length) return []
-    const tsd = getTravelStartDate(fStartMode, fTravelStart)
-    return tsd ? adjustBaseDates(fParsed.dates, tsd) : fParsed.dates
-  }, [fParsed, fStartMode, fTravelStart])
-
-  /* ── Shift preview (add form) ── */
-  const shiftPreview = useMemo(() => {
-    if (!adjustedBaseDates.length) return []
-    return computeShiftPreview(adjustedBaseDates, fShiftStart, fShiftEnd, fStepDays)
-  }, [adjustedBaseDates, fShiftStart, fShiftEnd, fStepDays])
-
-  /* ── Edit: adjusted base dates ── */
-  const eAdjustedDates = useMemo(() => {
-    if (!eUrlParsed?.dates?.length || !editingId) return []
-    const tsd = getTravelStartDate(eFields.startMode, eFields.travelStart)
-    return tsd ? adjustBaseDates(eUrlParsed.dates, tsd) : eUrlParsed.dates
-  }, [eUrlParsed, eFields.startMode, eFields.travelStart, editingId])
-
-  /* ── Edit: shift preview ── */
-  const eShiftPreview = useMemo(() => {
-    if (!eAdjustedDates.length || !editingId) return []
-    return computeShiftPreview(eAdjustedDates, eFields.shift_start ?? 0, eFields.shift_end ?? 4, eFields.shift_step_days ?? 7)
-  }, [eAdjustedDates, eFields.shift_start, eFields.shift_end, eFields.shift_step_days, editingId])
 
   /* ── Load snapshots ── */
   useEffect(() => {
@@ -326,12 +265,17 @@ export default function FlightSearchApp({ session }) {
     load()
   }, [selSearchId])
 
+  /* ── Shift preview ── */
+  const shiftPreview = useMemo(() => {
+    if (!fParsed?.dates?.length) return []
+    return computeShiftPreview(fParsed.dates, fShiftStart, fShiftEnd, fStepDays)
+  }, [fParsed, fShiftStart, fShiftEnd, fStepDays])
+
   /* ── Save new search ── */
   const saveSearch = async () => {
     if (!fParsed) return notify('Paste a valid Google Flights URL')
     if (!fName.trim()) return notify('Enter a name')
     setSaving(true)
-    const tsd = getTravelStartDate(fStartMode, fTravelStart)
     const { data, error } = await supabase
       .from('tracked_searches')
       .insert({
@@ -340,12 +284,11 @@ export default function FlightSearchApp({ session }) {
         base_url: fUrl.trim(),
         parsed_legs: fParsed.legs,
         base_dates: fParsed.dates,
-        travel_start_date: tsd,
         shift_start: fShiftStart,
         shift_end: fShiftEnd,
         shift_step_days: fStepDays,
         schedule_interval_days: fOneOff ? 0 : fSchedDays,
-        stop_date: fOneOff ? null : (fHasEndDate ? fStopDate || null : null),
+        stop_date: fOneOff ? null : (fStopDate || null),
         is_active: true,
         next_run_at: new Date().toISOString(),
       })
@@ -353,61 +296,38 @@ export default function FlightSearchApp({ session }) {
     setSaving(false)
     if (!error && data) {
       setSearches(prev => [data, ...prev])
-      resetAddForm()
+      setFUrl(''); setFName(''); setFParsed(null); setShowAdd(false); setFOneOff(false)
       notify(fOneOff ? 'Queued for one-off run!' : 'Tracking started!')
     } else {
       notify('Error: ' + (error?.message || 'Unknown'))
     }
   }
 
-  const resetAddForm = () => {
-    setFUrl(''); setFName(''); setFParsed(null); setShowAdd(false)
-    setFOneOff(false); setFStartMode('url'); setFTravelStart('')
-    setFHasEndDate(true); setFStopDate('')
-  }
-
   /* ── Edit handlers ── */
   const startEdit = (s) => {
     setEditingId(s.id)
-    const parsed = parseFlightUrl(s.base_url)
-    setEUrlParsed(parsed)
     setEFields({
       name: s.name || '',
-      base_url: s.base_url || '',
       shift_start: s.shift_start ?? 0,
       shift_end: s.shift_end ?? 4,
       shift_step_days: s.shift_step_days ?? 7,
       schedule_interval_days: s.schedule_interval_days ?? 1,
       stop_date: s.stop_date || '',
       oneoff: (s.schedule_interval_days || 0) === 0,
-      startMode: s.travel_start_date ? 'custom' : 'url',
-      travelStart: s.travel_start_date || '',
-      hasEndDate: !!s.stop_date,
     })
   }
 
   const updateE = (k, v) => setEFields(prev => ({ ...prev, [k]: v }))
 
-  const handleEUrlChange = (url) => {
-    updateE('base_url', url)
-    const parsed = url.trim() ? parseFlightUrl(url.trim()) : null
-    setEUrlParsed(parsed)
-  }
-
   const saveEdit = async () => {
     setESaving(true)
-    const tsd = getTravelStartDate(eFields.startMode, eFields.travelStart)
     const upd = {
       name: eFields.name,
-      base_url: eFields.base_url,
-      parsed_legs: eUrlParsed?.legs || [],
-      base_dates: eUrlParsed?.dates || [],
-      travel_start_date: tsd,
       shift_start: eFields.shift_start,
       shift_end: eFields.shift_end,
       shift_step_days: eFields.shift_step_days,
       schedule_interval_days: eFields.oneoff ? 0 : eFields.schedule_interval_days,
-      stop_date: eFields.oneoff ? null : (eFields.hasEndDate ? eFields.stop_date || null : null),
+      stop_date: eFields.oneoff ? null : (eFields.stop_date || null),
     }
     const { error } = await supabase.from('tracked_searches').update(upd).eq('id', editingId)
     setESaving(false)
@@ -525,65 +445,10 @@ export default function FlightSearchApp({ session }) {
     </label>
   )
 
-  const Pill = ({ label, active, onClick }) => (
-    <button onClick={onClick}
-      className={`text-[12px] tracking-[0.06em] uppercase px-3 py-1.5 rounded-full transition-all ${
-        active ? 'bg-[#222] text-[#f5f5ee] font-bold' : 'bg-[#f0f0ea] opacity-60 hover:opacity-100'
-      }`}>
-      {label}
-    </button>
-  )
-
   const Card = ({ children, className = '' }) => (
     <div className={className}
       style={{ borderRadius: '20px', boxShadow: '0 2px 12px rgba(0,0,0,0.06)', background: '#fff', overflow: 'hidden' }}>
       {children}
-    </div>
-  )
-
-  /* ── Shared sub-components ── */
-  const TravelStartPicker = ({ mode, onModeChange, customDate, onCustomChange, baseDates, adjustedDates }) => (
-    <div>
-      <label className="text-[10px] tracking-[0.12em] uppercase opacity-40 font-bold block mb-1.5">First Departure Date</label>
-      <div className="flex gap-1.5 flex-wrap">
-        <Pill label="URL Dates" active={mode === 'url'} onClick={() => onModeChange('url')} />
-        <Pill label="+2 Weeks" active={mode === '2weeks'} onClick={() => onModeChange('2weeks')} />
-        <Pill label="+1 Month" active={mode === '1month'} onClick={() => onModeChange('1month')} />
-        <Pill label="Custom" active={mode === 'custom'} onClick={() => onModeChange('custom')} />
-      </div>
-      {mode === 'custom' && (
-        <input type="date" value={customDate}
-          onChange={e => onCustomChange(e.target.value)}
-          className={`w-full ${B} bg-[#f0f0ea] rounded-xl px-4 py-3 outline-none tracking-wide border-2 border-transparent focus:border-[#222] transition-colors mt-2`}
-        />
-      )}
-      {mode !== 'url' && adjustedDates?.length > 0 && baseDates?.length > 0 && (
-        <div className="mt-2 bg-emerald-50 rounded-xl px-4 py-2.5">
-          <p className="text-[10px] tracking-[0.12em] uppercase text-emerald-700 font-bold mb-1">✈ Adjusted Dates</p>
-          {adjustedDates.map((d, i) => (
-            <p key={i} className={`${B} text-emerald-700 opacity-70 py-0.5 tabular-nums`}>
-              <span className="opacity-40 line-through mr-2">{baseDates[i]}</span>
-              → {fmtDate(d)}
-            </p>
-          ))}
-        </div>
-      )}
-    </div>
-  )
-
-  const EndDatePicker = ({ hasEnd, onHasEndChange, date, onDateChange, disabled = false }) => (
-    <div>
-      <label className="text-[10px] tracking-[0.12em] uppercase opacity-40 font-bold block mb-1.5">Stop Tracking</label>
-      <div className="flex gap-1.5 flex-wrap">
-        <Pill label="No End Date" active={!hasEnd} onClick={() => onHasEndChange(false)} />
-        <Pill label="Until Date" active={hasEnd} onClick={() => onHasEndChange(true)} />
-      </div>
-      {hasEnd && !disabled && (
-        <input type="date" value={date}
-          onChange={e => onDateChange(e.target.value)}
-          className={`w-full ${B} bg-[#f0f0ea] rounded-xl px-4 py-3 outline-none tracking-wide border-2 border-transparent focus:border-[#222] transition-colors mt-2`}
-        />
-      )}
     </div>
   )
 
@@ -599,10 +464,7 @@ export default function FlightSearchApp({ session }) {
     const isOneOff = (s.schedule_interval_days || 0) === 0
     const shifts = `${(s.shift_end ?? 0) - (s.shift_start ?? 0) + 1} shifts × ${s.shift_step_days ?? 7}d`
     if (isOneOff) return `${shifts} · One-off`
-    let label = `${shifts} · Every ${s.schedule_interval_days}d`
-    if (s.stop_date) label += ` · Stops ${s.stop_date}`
-    else label += ' · No end date'
-    return label
+    return `${shifts} · Every ${s.schedule_interval_days}d${s.stop_date ? ` · Stops ${s.stop_date}` : ''}`
   }
 
   return (
@@ -682,7 +544,7 @@ export default function FlightSearchApp({ session }) {
               <div className="px-5 py-4 space-y-3">
                 <div className="flex items-center justify-between mb-1">
                   <span className={`${B} font-bold tracking-[0.1em] uppercase opacity-30`}>New Tracked Search</span>
-                  <button onClick={resetAddForm}
+                  <button onClick={() => { setShowAdd(false); setFUrl(''); setFParsed(null); setFOneOff(false) }}
                     className={`${B} opacity-25 hover:opacity-100`}>✕</button>
                 </div>
 
@@ -720,16 +582,6 @@ export default function FlightSearchApp({ session }) {
                   <>
                     <Input label="Name" value={fName} onChange={setFName} placeholder="e.g. BNE-HKG-PVG June trip" />
 
-                    {/* Travel start date */}
-                    <TravelStartPicker
-                      mode={fStartMode}
-                      onModeChange={setFStartMode}
-                      customDate={fTravelStart}
-                      onCustomChange={setFTravelStart}
-                      baseDates={fParsed.dates}
-                      adjustedDates={adjustedBaseDates}
-                    />
-
                     {/* Shift settings */}
                     <div>
                       <label className="text-[10px] tracking-[0.12em] uppercase opacity-40 font-bold block mb-2">Date Shifting</label>
@@ -752,21 +604,16 @@ export default function FlightSearchApp({ session }) {
                       )}
                     </div>
 
-                    {/* One-off toggle */}
+                    {/* ★ One-off toggle */}
                     <div className="pt-1">
                       <Toggle label="One-off (run once, don't repeat)" checked={fOneOff} onChange={setFOneOff} />
                     </div>
 
                     {/* Schedule — hidden when one-off */}
                     {!fOneOff && (
-                      <div className="space-y-3">
+                      <div className="grid grid-cols-2 gap-2">
                         <Input label="Re-check every (days)" type="number" value={fSchedDays} onChange={setFSchedDays} />
-                        <EndDatePicker
-                          hasEnd={fHasEndDate}
-                          onHasEndChange={setFHasEndDate}
-                          date={fStopDate}
-                          onDateChange={setFStopDate}
-                        />
+                        <Input label="Stop date (optional)" type="date" value={fStopDate} onChange={setFStopDate} />
                       </div>
                     )}
 
@@ -813,11 +660,6 @@ export default function FlightSearchApp({ session }) {
                             </span>
                           </div>
                           <p className={`${B} opacity-40 mt-1`}>{routeLabel(s.parsed_legs)}</p>
-                          {s.travel_start_date && (
-                            <p className={`${B} opacity-40 mt-0.5 tabular-nums`}>
-                              <span className="text-emerald-600">✈ Departs {fmtDate(s.travel_start_date)}</span>
-                            </p>
-                          )}
                           <p className={`${B} opacity-25 mt-0.5 tabular-nums`}>{scheduleLabel(s)}</p>
                         </div>
                       </div>
@@ -846,81 +688,31 @@ export default function FlightSearchApp({ session }) {
                         <button onClick={() => setEditingId(null)} className={`${B} opacity-25 hover:opacity-100`}>✕</button>
                       </div>
 
-                      {/* Editable URL */}
-                      <div>
-                        <label className="text-[10px] tracking-[0.12em] uppercase opacity-40 font-bold block mb-1">Google Flights URL</label>
-                        <textarea
-                          className={`w-full ${B} bg-[#f0f0ea] rounded-xl px-4 py-3 outline-none tracking-wide border-2 border-transparent focus:border-[#222] transition-colors resize-none`}
-                          rows={3} value={eFields.base_url}
-                          onChange={e => handleEUrlChange(e.target.value)}
-                        />
-                      </div>
-
-                      {/* Parse feedback */}
-                      {eFields.base_url && !eUrlParsed && (
-                        <p className={`${B} text-red-500 opacity-70`}>
-                          Could not parse URL. Check the tfs= parameter.
-                        </p>
-                      )}
-                      {eUrlParsed && (
-                        <div className="bg-[#f0f0ea] rounded-xl px-4 py-3">
-                          <p className="text-[10px] tracking-[0.12em] uppercase opacity-40 font-bold mb-1">
-                            ✓ {eUrlParsed.legs.length} leg{eUrlParsed.legs.length !== 1 ? 's' : ''} detected
+                      {/* Route (read-only) */}
+                      <div className="bg-[#f0f0ea] rounded-xl px-4 py-3">
+                        <p className="text-[10px] tracking-[0.12em] uppercase opacity-40 font-bold mb-1">Route (read-only)</p>
+                        {s.parsed_legs?.map((l, i) => (
+                          <p key={i} className={`${B} opacity-50 py-0.5`}>
+                            {pad2(i + 1)}. {airportLabel(l.from)} → {airportLabel(l.to)}
+                            <span className="opacity-40 ml-2">{l.date}</span>
                           </p>
-                          {eUrlParsed.legs.map((l, i) => (
-                            <p key={i} className={`${B} opacity-50 py-0.5`}>
-                              {pad2(i + 1)}. {airportLabel(l.from)} → {airportLabel(l.to)}
-                              <span className="opacity-40 ml-2">{l.date}</span>
-                            </p>
-                          ))}
-                        </div>
-                      )}
+                        ))}
+                      </div>
 
                       <Input label="Name" value={eFields.name} onChange={v => updateE('name', v)} />
 
-                      {/* Travel start date */}
-                      <TravelStartPicker
-                        mode={eFields.startMode}
-                        onModeChange={v => updateE('startMode', v)}
-                        customDate={eFields.travelStart}
-                        onCustomChange={v => updateE('travelStart', v)}
-                        baseDates={eUrlParsed?.dates || []}
-                        adjustedDates={eAdjustedDates}
-                      />
-
-                      {/* Shifts */}
-                      <div>
-                        <label className="text-[10px] tracking-[0.12em] uppercase opacity-40 font-bold block mb-2">Date Shifting</label>
-                        <div className="grid grid-cols-3 gap-2">
-                          <Input label="From shift" type="number" value={eFields.shift_start} onChange={v => updateE('shift_start', v)} />
-                          <Input label="To shift" type="number" value={eFields.shift_end} onChange={v => updateE('shift_end', v)} />
-                          <Input label="Step (days)" type="number" value={eFields.shift_step_days} onChange={v => updateE('shift_step_days', v)} />
-                        </div>
-                        {eShiftPreview.length > 0 && (
-                          <div className="mt-2 bg-[#f0f0ea] rounded-xl px-4 py-3 max-h-40 overflow-y-auto">
-                            <p className="text-[10px] tracking-[0.12em] uppercase opacity-40 font-bold mb-1">
-                              Preview — {eShiftPreview.length} shift{eShiftPreview.length !== 1 ? 's' : ''}
-                            </p>
-                            {eShiftPreview.map(sp => (
-                              <p key={sp.shift} className={`${B} opacity-50 py-0.5 tabular-nums`}>
-                                +{sp.shift} ({sp.days}d): {sp.dates.map(d => fmtDate(d)).join(' · ')}
-                              </p>
-                            ))}
-                          </div>
-                        )}
+                      <div className="grid grid-cols-3 gap-2">
+                        <Input label="From shift" type="number" value={eFields.shift_start} onChange={v => updateE('shift_start', v)} />
+                        <Input label="To shift" type="number" value={eFields.shift_end} onChange={v => updateE('shift_end', v)} />
+                        <Input label="Step (days)" type="number" value={eFields.shift_step_days} onChange={v => updateE('shift_step_days', v)} />
                       </div>
 
                       <Toggle label="One-off (run once, don't repeat)" checked={eFields.oneoff} onChange={v => updateE('oneoff', v)} />
 
                       {!eFields.oneoff && (
-                        <div className="space-y-3">
+                        <div className="grid grid-cols-2 gap-2">
                           <Input label="Re-check every (days)" type="number" value={eFields.schedule_interval_days} onChange={v => updateE('schedule_interval_days', v)} />
-                          <EndDatePicker
-                            hasEnd={eFields.hasEndDate}
-                            onHasEndChange={v => updateE('hasEndDate', v)}
-                            date={eFields.stop_date}
-                            onDateChange={v => updateE('stop_date', v)}
-                          />
+                          <Input label="Stop date (optional)" type="date" value={eFields.stop_date} onChange={v => updateE('stop_date', v)} />
                         </div>
                       )}
 
