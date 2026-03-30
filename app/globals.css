@@ -1,6 +1,4 @@
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+@import "tailwindcss";
 
 html, body {
   margin: 0;
@@ -9,7 +7,6 @@ html, body {
   -moz-osx-font-smoothing: grayscale;
 }
 
-/* Remove default blue focus outlines on inputs in Safari/Chrome */
 input:focus, select:focus, textarea:focus {
   outline: none;
 }
