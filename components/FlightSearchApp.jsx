@@ -85,23 +85,16 @@ const timeUntil = (d) => {
 }
 
 /* ─────── TRAVEL START DATE HELPERS ─────── */
-function getTravelStartDate(mode, customDate) {
-  switch (mode) {
-    case '2weeks': {
-      const d = new Date()
-      d.setDate(d.getDate() + 14)
-      return d.toISOString().slice(0, 10)
-    }
-    case '1month': {
-      const d = new Date()
-      d.setDate(d.getDate() + 30)
-      return d.toISOString().slice(0, 10)
-    }
-    case 'custom':
-      return customDate || null
-    default:
-      return null
+// Returns a resolved date string for PREVIEW purposes only.
+// For 'relative' mode the daemon recomputes at run time.
+function getTravelStartDate(mode, relativeDays, customDate) {
+  if (mode === 'relative') {
+    const d = new Date()
+    d.setDate(d.getDate() + (relativeDays || 0))
+    return d.toISOString().slice(0, 10)
   }
+  if (mode === 'custom') return customDate || null
+  return null // 'url' → no offset
 }
 
 function adjustBaseDates(baseDates, travelStartDate) {
@@ -116,7 +109,7 @@ function adjustBaseDates(baseDates, travelStartDate) {
   })
 }
 
-/* ─────── URL PARSER — v4 (handles KG-encoded airports) ─────── */
+/* ─────── URL PARSER — v4 ─────── */
 function parseFlightUrl(url) {
   try {
     const u = new URL(url)
@@ -173,7 +166,6 @@ function parseFlightUrl(url) {
         legs[i].from = legs[i - 1].to
       }
     }
-
     if (!legs[0].from && legs[0].to && legs.length > 1 && legs[legs.length - 1].to) {
       legs[0].from = legs[legs.length - 1].to
     }
@@ -226,8 +218,9 @@ export default function FlightSearchApp({ session }) {
   const [fSchedDays, setFSchedDays] = useState(1)
   const [fStopDate, setFStopDate] = useState('')
   const [fOneOff, setFOneOff] = useState(false)
-  const [fStartMode, setFStartMode] = useState('url')
-  const [fTravelStart, setFTravelStart] = useState('')
+  const [fStartMode, setFStartMode] = useState('url')      // 'url' | 'relative' | 'custom'
+  const [fRelativeDays, setFRelativeDays] = useState(14)
+  const [fTravelStart, setFTravelStart] = useState('')       // custom date
   const [fHasEndDate, setFHasEndDate] = useState(true)
 
   // Edit
@@ -271,24 +264,24 @@ export default function FlightSearchApp({ session }) {
     }
   }, [fUrl])
 
-  /* ── Auto stop date when parsed or travel start changes (add form) ── */
+  /* ── Auto stop date (add form) ── */
   useEffect(() => {
     if (!fParsed?.dates?.length || !fHasEndDate || fOneOff) return
-    const tsd = getTravelStartDate(fStartMode, fTravelStart)
+    const tsd = getTravelStartDate(fStartMode, fRelativeDays, fTravelStart)
     const adjusted = adjustBaseDates(fParsed.dates, tsd)
     if (adjusted?.length) {
       const first = new Date(adjusted[0])
       first.setDate(first.getDate() - 7)
       setFStopDate(first.toISOString().slice(0, 10))
     }
-  }, [fParsed, fStartMode, fTravelStart, fHasEndDate, fOneOff])
+  }, [fParsed, fStartMode, fRelativeDays, fTravelStart, fHasEndDate, fOneOff])
 
   /* ── Adjusted base dates (add form) ── */
   const adjustedBaseDates = useMemo(() => {
     if (!fParsed?.dates?.length) return []
-    const tsd = getTravelStartDate(fStartMode, fTravelStart)
+    const tsd = getTravelStartDate(fStartMode, fRelativeDays, fTravelStart)
     return tsd ? adjustBaseDates(fParsed.dates, tsd) : fParsed.dates
-  }, [fParsed, fStartMode, fTravelStart])
+  }, [fParsed, fStartMode, fRelativeDays, fTravelStart])
 
   /* ── Shift preview (add form) ── */
   const shiftPreview = useMemo(() => {
@@ -299,9 +292,9 @@ export default function FlightSearchApp({ session }) {
   /* ── Edit: adjusted base dates ── */
   const eAdjustedDates = useMemo(() => {
     if (!eUrlParsed?.dates?.length || !editingId) return []
-    const tsd = getTravelStartDate(eFields.startMode, eFields.travelStart)
+    const tsd = getTravelStartDate(eFields.startMode, eFields.relativeDays, eFields.travelStart)
     return tsd ? adjustBaseDates(eUrlParsed.dates, tsd) : eUrlParsed.dates
-  }, [eUrlParsed, eFields.startMode, eFields.travelStart, editingId])
+  }, [eUrlParsed, eFields.startMode, eFields.relativeDays, eFields.travelStart, editingId])
 
   /* ── Edit: shift preview ── */
   const eShiftPreview = useMemo(() => {
@@ -331,7 +324,6 @@ export default function FlightSearchApp({ session }) {
     if (!fParsed) return notify('Paste a valid Google Flights URL')
     if (!fName.trim()) return notify('Enter a name')
     setSaving(true)
-    const tsd = getTravelStartDate(fStartMode, fTravelStart)
     const { data, error } = await supabase
       .from('tracked_searches')
       .insert({
@@ -340,7 +332,9 @@ export default function FlightSearchApp({ session }) {
         base_url: fUrl.trim(),
         parsed_legs: fParsed.legs,
         base_dates: fParsed.dates,
-        travel_start_date: tsd,
+        travel_date_mode: fStartMode,
+        travel_date_relative_days: fStartMode === 'relative' ? fRelativeDays : null,
+        travel_start_date: fStartMode === 'custom' ? fTravelStart || null : null,
         shift_start: fShiftStart,
         shift_end: fShiftEnd,
         shift_step_days: fStepDays,
@@ -362,8 +356,8 @@ export default function FlightSearchApp({ session }) {
 
   const resetAddForm = () => {
     setFUrl(''); setFName(''); setFParsed(null); setShowAdd(false)
-    setFOneOff(false); setFStartMode('url'); setFTravelStart('')
-    setFHasEndDate(true); setFStopDate('')
+    setFOneOff(false); setFStartMode('url'); setFRelativeDays(14)
+    setFTravelStart(''); setFHasEndDate(true); setFStopDate('')
   }
 
   /* ── Edit handlers ── */
@@ -371,6 +365,8 @@ export default function FlightSearchApp({ session }) {
     setEditingId(s.id)
     const parsed = parseFlightUrl(s.base_url)
     setEUrlParsed(parsed)
+    // Restore mode: use saved mode, or infer from old records
+    const mode = s.travel_date_mode || (s.travel_start_date ? 'custom' : 'url')
     setEFields({
       name: s.name || '',
       base_url: s.base_url || '',
@@ -380,7 +376,8 @@ export default function FlightSearchApp({ session }) {
       schedule_interval_days: s.schedule_interval_days ?? 1,
       stop_date: s.stop_date || '',
       oneoff: (s.schedule_interval_days || 0) === 0,
-      startMode: s.travel_start_date ? 'custom' : 'url',
+      startMode: mode,
+      relativeDays: s.travel_date_relative_days ?? 14,
       travelStart: s.travel_start_date || '',
       hasEndDate: !!s.stop_date,
     })
@@ -396,13 +393,14 @@ export default function FlightSearchApp({ session }) {
 
   const saveEdit = async () => {
     setESaving(true)
-    const tsd = getTravelStartDate(eFields.startMode, eFields.travelStart)
     const upd = {
       name: eFields.name,
       base_url: eFields.base_url,
       parsed_legs: eUrlParsed?.legs || [],
       base_dates: eUrlParsed?.dates || [],
-      travel_start_date: tsd,
+      travel_date_mode: eFields.startMode,
+      travel_date_relative_days: eFields.startMode === 'relative' ? eFields.relativeDays : null,
+      travel_start_date: eFields.startMode === 'custom' ? eFields.travelStart || null : null,
       shift_start: eFields.shift_start,
       shift_end: eFields.shift_end,
       shift_step_days: eFields.shift_step_days,
@@ -542,34 +540,66 @@ export default function FlightSearchApp({ session }) {
   )
 
   /* ── Shared sub-components ── */
-  const TravelStartPicker = ({ mode, onModeChange, customDate, onCustomChange, baseDates, adjustedDates }) => (
-    <div>
-      <label className="text-[10px] tracking-[0.12em] uppercase opacity-40 font-bold block mb-1.5">First Departure Date</label>
-      <div className="flex gap-1.5 flex-wrap">
-        <Pill label="URL Dates" active={mode === 'url'} onClick={() => onModeChange('url')} />
-        <Pill label="+2 Weeks" active={mode === '2weeks'} onClick={() => onModeChange('2weeks')} />
-        <Pill label="+1 Month" active={mode === '1month'} onClick={() => onModeChange('1month')} />
-        <Pill label="Custom" active={mode === 'custom'} onClick={() => onModeChange('custom')} />
-      </div>
-      {mode === 'custom' && (
-        <input type="date" value={customDate}
-          onChange={e => onCustomChange(e.target.value)}
-          className={`w-full ${B} bg-[#f0f0ea] rounded-xl px-4 py-3 outline-none tracking-wide border-2 border-transparent focus:border-[#222] transition-colors mt-2`}
-        />
-      )}
-      {mode !== 'url' && adjustedDates?.length > 0 && baseDates?.length > 0 && (
-        <div className="mt-2 bg-emerald-50 rounded-xl px-4 py-2.5">
-          <p className="text-[10px] tracking-[0.12em] uppercase text-emerald-700 font-bold mb-1">✈ Adjusted Dates</p>
-          {adjustedDates.map((d, i) => (
-            <p key={i} className={`${B} text-emerald-700 opacity-70 py-0.5 tabular-nums`}>
-              <span className="opacity-40 line-through mr-2">{baseDates[i]}</span>
-              → {fmtDate(d)}
-            </p>
-          ))}
+  const TravelStartPicker = ({ mode, onModeChange, relativeDays, onRelativeDaysChange, customDate, onCustomChange, baseDates, adjustedDates }) => {
+    // Compute inline preview for relative mode
+    let relativePreview = null
+    if (mode === 'relative') {
+      const d = new Date()
+      d.setDate(d.getDate() + (relativeDays || 0))
+      relativePreview = d.toISOString().slice(0, 10)
+    }
+
+    return (
+      <div>
+        <label className="text-[10px] tracking-[0.12em] uppercase opacity-40 font-bold block mb-1.5">First Departure Date</label>
+        <div className="flex gap-1.5 flex-wrap">
+          <Pill label="URL Dates" active={mode === 'url'} onClick={() => onModeChange('url')} />
+          <Pill label="Days from Now" active={mode === 'relative'} onClick={() => onModeChange('relative')} />
+          <Pill label="Fixed Date" active={mode === 'custom'} onClick={() => onModeChange('custom')} />
         </div>
-      )}
-    </div>
-  )
+
+        {mode === 'relative' && (
+          <div className="mt-2">
+            <div className="flex items-center gap-2">
+              <input
+                type="number"
+                value={relativeDays}
+                onChange={e => onRelativeDaysChange(parseInt(e.target.value, 10) || 0)}
+                className={`${B} bg-[#f0f0ea] rounded-xl px-4 py-3 outline-none tracking-wide border-2 border-transparent focus:border-[#222] transition-colors`}
+                style={{ width: '100px' }}
+              />
+              <span className={`${B} opacity-40`}>days from today</span>
+              {relativePreview && (
+                <span className={`${B} opacity-30 tabular-nums`}>→ {fmtDate(relativePreview)}</span>
+              )}
+            </div>
+            <p className="text-[10px] tracking-[0.08em] uppercase opacity-25 mt-1.5">
+              Recalculated each time the daemon runs
+            </p>
+          </div>
+        )}
+
+        {mode === 'custom' && (
+          <input type="date" value={customDate}
+            onChange={e => onCustomChange(e.target.value)}
+            className={`w-full ${B} bg-[#f0f0ea] rounded-xl px-4 py-3 outline-none tracking-wide border-2 border-transparent focus:border-[#222] transition-colors mt-2`}
+          />
+        )}
+
+        {mode !== 'url' && adjustedDates?.length > 0 && baseDates?.length > 0 && (
+          <div className="mt-2 bg-emerald-50 rounded-xl px-4 py-2.5">
+            <p className="text-[10px] tracking-[0.12em] uppercase text-emerald-700 font-bold mb-1">✈ Adjusted Dates{mode === 'relative' ? ' (as of today)' : ''}</p>
+            {adjustedDates.map((d, i) => (
+              <p key={i} className={`${B} text-emerald-700 opacity-70 py-0.5 tabular-nums`}>
+                <span className="opacity-40 line-through mr-2">{baseDates[i]}</span>
+                → {fmtDate(d)}
+              </p>
+            ))}
+          </div>
+        )}
+      </div>
+    )
+  }
 
   const EndDatePicker = ({ hasEnd, onHasEndChange, date, onDateChange, disabled = false }) => (
     <div>
@@ -587,12 +617,19 @@ export default function FlightSearchApp({ session }) {
     </div>
   )
 
-  /* ── Route label ── */
+  /* ── Display helpers ── */
   const routeLabel = (legs) => {
     if (!legs?.length) return ''
     const codes = legs.map(l => l.from)
     codes.push(legs[legs.length - 1].to)
     return codes.join(' → ')
+  }
+
+  const travelLabel = (s) => {
+    const mode = s.travel_date_mode || (s.travel_start_date ? 'custom' : 'url')
+    if (mode === 'relative') return `✈ +${s.travel_date_relative_days ?? 14}d from run date`
+    if (mode === 'custom' && s.travel_start_date) return `✈ Departs ${fmtDate(s.travel_start_date)}`
+    return null
   }
 
   const scheduleLabel = (s) => {
@@ -668,7 +705,6 @@ export default function FlightSearchApp({ session }) {
       {tab === 'track' && (
         <div className="max-w-2xl mx-auto px-4 py-2 space-y-4">
 
-          {/* Add button */}
           {!showAdd && (
             <button onClick={() => setShowAdd(true)}
               className={`w-full py-4 ${B} tracking-[0.15em] uppercase font-bold border-2 border-dashed rounded-2xl border-[#bbb] hover:border-[#222] active:bg-[#f0f0e5] transition-all`}>
@@ -682,11 +718,9 @@ export default function FlightSearchApp({ session }) {
               <div className="px-5 py-4 space-y-3">
                 <div className="flex items-center justify-between mb-1">
                   <span className={`${B} font-bold tracking-[0.1em] uppercase opacity-30`}>New Tracked Search</span>
-                  <button onClick={resetAddForm}
-                    className={`${B} opacity-25 hover:opacity-100`}>✕</button>
+                  <button onClick={resetAddForm} className={`${B} opacity-25 hover:opacity-100`}>✕</button>
                 </div>
 
-                {/* URL */}
                 <div>
                   <label className="text-[10px] tracking-[0.12em] uppercase opacity-40 font-bold block mb-1">Google Flights URL</label>
                   <textarea
@@ -696,7 +730,6 @@ export default function FlightSearchApp({ session }) {
                   />
                 </div>
 
-                {/* Parse feedback */}
                 {fUrl && !fParsed && (
                   <p className={`${B} text-red-500 opacity-70`}>
                     Could not parse URL. Make sure it's a Google Flights search URL with a tfs= parameter.
@@ -720,17 +753,17 @@ export default function FlightSearchApp({ session }) {
                   <>
                     <Input label="Name" value={fName} onChange={setFName} placeholder="e.g. BNE-HKG-PVG June trip" />
 
-                    {/* Travel start date */}
                     <TravelStartPicker
                       mode={fStartMode}
                       onModeChange={setFStartMode}
+                      relativeDays={fRelativeDays}
+                      onRelativeDaysChange={setFRelativeDays}
                       customDate={fTravelStart}
                       onCustomChange={setFTravelStart}
                       baseDates={fParsed.dates}
                       adjustedDates={adjustedBaseDates}
                     />
 
-                    {/* Shift settings */}
                     <div>
                       <label className="text-[10px] tracking-[0.12em] uppercase opacity-40 font-bold block mb-2">Date Shifting</label>
                       <div className="grid grid-cols-3 gap-2">
@@ -752,12 +785,10 @@ export default function FlightSearchApp({ session }) {
                       )}
                     </div>
 
-                    {/* One-off toggle */}
                     <div className="pt-1">
                       <Toggle label="One-off (run once, don't repeat)" checked={fOneOff} onChange={setFOneOff} />
                     </div>
 
-                    {/* Schedule — hidden when one-off */}
                     {!fOneOff && (
                       <div className="space-y-3">
                         <Input label="Re-check every (days)" type="number" value={fSchedDays} onChange={setFSchedDays} />
@@ -770,7 +801,6 @@ export default function FlightSearchApp({ session }) {
                       </div>
                     )}
 
-                    {/* Save */}
                     <button onClick={saveSearch} disabled={saving}
                       className={`w-full py-4 ${B} tracking-[0.15em] uppercase font-bold rounded-2xl transition-all ${
                         saving ? 'bg-[#888] text-[#f5f5ee] cursor-wait animate-pulse' : 'bg-[#222] text-[#f5f5ee] hover:bg-[#444]'
@@ -783,7 +813,6 @@ export default function FlightSearchApp({ session }) {
             </Card>
           )}
 
-          {/* Empty state */}
           {searches.length === 0 && !showAdd && (
             <div className="py-16 text-center">
               <p className={`${B} tracking-[0.12em] uppercase opacity-20`}>No tracked searches yet</p>
@@ -796,12 +825,12 @@ export default function FlightSearchApp({ session }) {
             const status = searchStatus(s)
             const isEditing = editingId === s.id
             const isOneOff = (s.schedule_interval_days || 0) === 0
+            const travel = travelLabel(s)
 
             return (
               <Card key={s.id}>
                 <div className="px-5 py-4">
 
-                  {/* ── Normal view ── */}
                   {!isEditing && (
                     <>
                       <div className="flex items-start justify-between gap-3">
@@ -813,9 +842,9 @@ export default function FlightSearchApp({ session }) {
                             </span>
                           </div>
                           <p className={`${B} opacity-40 mt-1`}>{routeLabel(s.parsed_legs)}</p>
-                          {s.travel_start_date && (
+                          {travel && (
                             <p className={`${B} opacity-40 mt-0.5 tabular-nums`}>
-                              <span className="text-emerald-600">✈ Departs {fmtDate(s.travel_start_date)}</span>
+                              <span className="text-emerald-600">{travel}</span>
                             </p>
                           )}
                           <p className={`${B} opacity-25 mt-0.5 tabular-nums`}>{scheduleLabel(s)}</p>
@@ -846,7 +875,6 @@ export default function FlightSearchApp({ session }) {
                         <button onClick={() => setEditingId(null)} className={`${B} opacity-25 hover:opacity-100`}>✕</button>
                       </div>
 
-                      {/* Editable URL */}
                       <div>
                         <label className="text-[10px] tracking-[0.12em] uppercase opacity-40 font-bold block mb-1">Google Flights URL</label>
                         <textarea
@@ -856,7 +884,6 @@ export default function FlightSearchApp({ session }) {
                         />
                       </div>
 
-                      {/* Parse feedback */}
                       {eFields.base_url && !eUrlParsed && (
                         <p className={`${B} text-red-500 opacity-70`}>
                           Could not parse URL. Check the tfs= parameter.
@@ -878,17 +905,17 @@ export default function FlightSearchApp({ session }) {
 
                       <Input label="Name" value={eFields.name} onChange={v => updateE('name', v)} />
 
-                      {/* Travel start date */}
                       <TravelStartPicker
                         mode={eFields.startMode}
                         onModeChange={v => updateE('startMode', v)}
+                        relativeDays={eFields.relativeDays}
+                        onRelativeDaysChange={v => updateE('relativeDays', v)}
                         customDate={eFields.travelStart}
                         onCustomChange={v => updateE('travelStart', v)}
                         baseDates={eUrlParsed?.dates || []}
                         adjustedDates={eAdjustedDates}
                       />
 
-                      {/* Shifts */}
                       <div>
                         <label className="text-[10px] tracking-[0.12em] uppercase opacity-40 font-bold block mb-2">Date Shifting</label>
                         <div className="grid grid-cols-3 gap-2">
@@ -977,7 +1004,6 @@ export default function FlightSearchApp({ session }) {
 
           {selSearchId && !loadingSnap && runs.length > 0 && (
             <>
-              {/* Latest run */}
               <Card>
                 <div className="px-5 py-4">
                   <div className="flex items-center justify-between mb-3">
@@ -1011,7 +1037,6 @@ export default function FlightSearchApp({ session }) {
                 </div>
               </Card>
 
-              {/* Trend charts */}
               {shiftTrendData.length >= 2 && (
                 <Card>
                   <div className="px-5 py-4">
@@ -1055,7 +1080,6 @@ export default function FlightSearchApp({ session }) {
                 </Card>
               )}
 
-              {/* Run history */}
               <div>
                 <p className={`${B} tracking-[0.12em] uppercase font-bold opacity-40 mb-3`}>All Runs ({runs.length})</p>
                 <div className="space-y-2">

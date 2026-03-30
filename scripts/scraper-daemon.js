@@ -108,18 +108,42 @@ function cheapestPrice(flights) {
   return best;
 }
 
+/* ─── Compute base offset from travel date settings ─── */
+function computeBaseOffset(job) {
+  // Determine mode: use saved mode, or infer from old records
+  const mode = job.travel_date_mode || (job.travel_start_date ? 'custom' : 'url');
+
+  if (mode === 'relative' && job.base_dates?.length) {
+    // Dynamic: today + N days
+    const days = job.travel_date_relative_days || 14;
+    const now = new Date();
+    now.setUTCHours(0, 0, 0, 0);
+    const target = new Date(now);
+    target.setDate(target.getDate() + days);
+    const firstBase = new Date(job.base_dates[0] + 'T00:00:00Z');
+    const offset = Math.round((target - firstBase) / 86400000);
+    log(`    Relative mode: +${days}d from today → ${target.toISOString().slice(0, 10)} (base offset: ${offset}d)`);
+    return offset;
+  }
+
+  if (mode === 'custom' && job.travel_start_date && job.base_dates?.length) {
+    // Fixed date
+    const travelStart = new Date(job.travel_start_date + 'T00:00:00Z');
+    const firstBase = new Date(job.base_dates[0] + 'T00:00:00Z');
+    const offset = Math.round((travelStart - firstBase) / 86400000);
+    return offset;
+  }
+
+  // mode === 'url' or no data → no offset
+  return 0;
+}
+
 /* ─── Job Runner ─── */
 async function runJob(page, job) {
   const runId = `run_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
   const { shift_start = 0, shift_end = 4, shift_step_days = 7 } = job;
 
-  // If travel_start_date is set, calculate base offset from original URL dates
-  let baseOffset = 0;
-  if (job.travel_start_date && job.base_dates?.length) {
-    const travelStart = new Date(job.travel_start_date + 'T00:00:00Z');
-    const firstBase = new Date(job.base_dates[0] + 'T00:00:00Z');
-    baseOffset = Math.round((travelStart - firstBase) / 86400000);
-  }
+  const baseOffset = computeBaseOffset(job);
 
   log(`  Job: "${job.name}" | Shifts ${shift_start}→${shift_end} × ${shift_step_days}d${baseOffset ? ` | Base offset: ${baseOffset}d` : ''}`);
 
@@ -200,7 +224,6 @@ async function checkAndRun() {
 
   log(`Found ${jobs.length} job(s) to run.`);
 
-  // Launch browser
   const profileDir = path.join(__dirname, '.browser-profile');
   let context;
   try {
@@ -228,7 +251,6 @@ async function checkAndRun() {
   });
 
   for (const job of jobs) {
-    // Check stop date
     if (job.stop_date && new Date() >= new Date(job.stop_date)) {
       log(`  "${job.name}" past stop date — deactivating.`);
       await supabase.from('tracked_searches')
@@ -243,7 +265,6 @@ async function checkAndRun() {
       log(`  Job "${job.name}" failed: ${err.message}`);
     }
 
-    // Schedule next run (or deactivate if one-off)
     const nowIso = new Date().toISOString();
 
     if ((job.schedule_interval_days || 0) === 0) {
