@@ -84,7 +84,7 @@ const timeUntil = (d) => {
   return `in ${Math.floor(h / 24)}d`
 }
 
-/* ─────── URL PARSER — FIXED ─────── */
+/* ─────── URL PARSER — v4 (handles KG-encoded airports) ─────── */
 function parseFlightUrl(url) {
   try {
     const u = new URL(url)
@@ -97,7 +97,7 @@ function parseFlightUrl(url) {
     const bytes = new Uint8Array(bin.length)
     for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i)
 
-    // Find all dates (YYYY-MM-DD)
+    // 1. Find all YYYY-MM-DD dates
     const dates = []
     const dateRe = /^\d{4}-\d{2}-\d{2}$/
     for (let j = 0; j <= bytes.length - 10; j++) {
@@ -105,43 +105,57 @@ function parseFlightUrl(url) {
       for (let k = 0; k < 10; k++) s += String.fromCharCode(bytes[j + k])
       if (dateRe.test(s)) { dates.push({ index: j, date: s }); j += 9 }
     }
+    if (!dates.length) return null
 
-    // Find all known airport codes
+    // 2. Find all known IATA codes (boundary-checked)
     const known = new Set(AIRPORTS.map(a => a.code))
-    const airports = []
+    const allCodes = []
     for (let j = 0; j <= bytes.length - 3; j++) {
       let s = ''
       for (let k = 0; k < 3; k++) s += String.fromCharCode(bytes[j + k])
       if (/^[A-Z]{3}$/.test(s) && known.has(s)) {
-        const bef = j > 0 ? String.fromCharCode(bytes[j - 1]) : ' '
-        const aft = j + 3 < bytes.length ? String.fromCharCode(bytes[j + 3]) : ' '
-        if (!/[A-Z]/.test(bef) && !/[A-Z]/.test(aft)) {
-          airports.push({ index: j, code: s }); j += 2
+        const befChar = j > 0 ? String.fromCharCode(bytes[j - 1]) : '\x00'
+        const aftChar = j + 3 < bytes.length ? String.fromCharCode(bytes[j + 3]) : '\x00'
+        if (!/[A-Z]/.test(befChar) && !/[A-Z]/.test(aftChar)) {
+          allCodes.push({ index: j, code: s })
+          j += 2
         }
       }
     }
 
-    // ★ FIX: In protobuf, airports are encoded BEFORE their date.
-    // Each leg's region: from previous date end → current date end.
-    const legs = []
-    for (let i = 0; i < dates.length; i++) {
-      const regionStart = i > 0 ? dates[i - 1].index + 10 : 0
-      const regionEnd = dates[i].index + 10
-      const regionAirports = airports.filter(a => a.index >= regionStart && a.index < regionEnd)
-      const seen = new Set()
+    // 3. Group codes by leg: each leg's airports appear AFTER its date, before next date
+    //    (In the protobuf, each leg sub-message has: date → origin → destination)
+    const legs = dates.map((d, i) => {
+      const segStart = d.index + 10
+      const segEnd = i + 1 < dates.length ? dates[i + 1].index : bytes.length
+      const segCodes = allCodes.filter(c => c.index >= segStart && c.index < segEnd)
+      // Deduplicate consecutive
       const unique = []
-      for (const a of regionAirports) {
-        if (!seen.has(a.code)) { seen.add(a.code); unique.push(a.code) }
+      for (const c of segCodes) {
+        if (!unique.length || c.code !== unique[unique.length - 1]) unique.push(c.code)
       }
-      if (unique.length >= 2) {
-        legs.push({ from: unique[unique.length - 2], to: unique[unique.length - 1], date: dates[i].date })
-      } else if (unique.length === 1 && legs.length > 0) {
-        // Only destination found — infer origin from previous leg
-        legs.push({ from: legs[legs.length - 1].to, to: unique[0], date: dates[i].date })
+      return {
+        date: d.date,
+        from: unique.length >= 2 ? unique[0] : null,
+        to: unique.length >= 2 ? unique[1] : (unique.length === 1 ? unique[0] : null),
+      }
+    })
+
+    // 4. Chain inference: fill missing origin from previous leg's destination
+    for (let i = 1; i < legs.length; i++) {
+      if (!legs[i].from && legs[i].to && legs[i - 1].to) {
+        legs[i].from = legs[i - 1].to
       }
     }
 
-    return { dates: dates.map(d => d.date), legs }
+    // 5. Round-trip heuristic: if first leg's origin still missing,
+    //    use last leg's destination (covers BNE→...→BNE pattern)
+    if (!legs[0].from && legs[0].to && legs.length > 1 && legs[legs.length - 1].to) {
+      legs[0].from = legs[legs.length - 1].to
+    }
+
+    const valid = legs.filter(l => l.from && l.to)
+    return valid.length ? { dates: dates.map(d => d.date), legs: valid } : null
   } catch { return null }
 }
 
