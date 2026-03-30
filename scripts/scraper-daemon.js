@@ -236,13 +236,22 @@ async function checkAndRun() {
       log(`  Job "${job.name}" failed: ${err.message}`);
     }
 
-    // Schedule next run
-    const next = new Date();
-    next.setDate(next.getDate() + (job.schedule_interval_days || 1));
-    await supabase.from('tracked_searches')
-      .update({ last_run_at: new Date().toISOString(), next_run_at: next.toISOString() })
-      .eq('id', job.id);
-    log(`  Next run for "${job.name}": ${next.toISOString()}`);
+    // Schedule next run (or deactivate if one-off)
+    const nowIso = new Date().toISOString();
+
+    if ((job.schedule_interval_days || 0) === 0) {
+      log(`  "${job.name}" is one-off — marking complete.`);
+      await supabase.from('tracked_searches')
+        .update({ last_run_at: nowIso, is_active: false })
+        .eq('id', job.id);
+    } else {
+      const next = new Date();
+      next.setDate(next.getDate() + (job.schedule_interval_days || 1));
+      await supabase.from('tracked_searches')
+        .update({ last_run_at: nowIso, next_run_at: next.toISOString() })
+        .eq('id', job.id);
+      log(`  Next run for "${job.name}": ${next.toISOString()}`);
+    }
 
     await delay(5000);
   }
