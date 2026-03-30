@@ -11,6 +11,11 @@ const RUN_ONCE = process.argv.includes('--once');
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
+// ===== ADD THIS =====
+console.log('KEY starts with:', SUPABASE_KEY?.substring(0, 20) || 'UNDEFINED!');
+// ====================
+
+
 function delay(ms) { return new Promise(r => setTimeout(r, ms)); }
 const log = (msg) => console.log(`[${new Date().toISOString()}] ${msg}`);
 
@@ -187,6 +192,12 @@ async function checkAndRun() {
     .eq('is_active', true)
     .lte('next_run_at', now)
     .order('next_run_at', { ascending: true });
+
+  // ===== ADD THESE 3 LINES =====
+  console.log('now =', now);
+  console.log('error:', error);
+  console.log('jobs found:', JSON.stringify(jobs));
+  // ===== END DEBUG LINES =====
 
   if (error) { log(`DB error: ${error.message}`); return; }
   if (!jobs?.length) { log('No jobs due.'); return; }
