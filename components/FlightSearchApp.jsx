@@ -84,6 +84,44 @@ const timeUntil = (d) => {
   return `in ${Math.floor(h / 24)}d`
 }
 
+/* ─────── FLIGHT SNIPPET PARSER ─────── */
+// Format: "12:05 AM12:05 AM on Wed, Apr 29 – 6:50 AM6:50 AM on Wed, Apr 29Cathay Pacific8 hr 45 min...Nonstop...A$1,108..."
+// or with stop: "7:10 PM...– 6:55 AM+1...Thu, Apr 30Qantas, Cathay Pacific13 hr 45 min...1 stop...A$1,191..."
+function parseFlightSnippet(text) {
+  if (!text || typeof text !== 'string') return null
+
+  // Departure time: very first HH:MM AM/PM in the string
+  const depM = text.match(/^(\d{1,2}:\d{2}\s*[AP]M)/i)
+  const depTime = depM ? depM[1] : null
+
+  // Arrival time + next-day flag: first HH:MM AM/PM immediately after " – "
+  let arrTime = null
+  const dashIdx = text.indexOf(' – ')
+  if (dashIdx !== -1) {
+    const arrM = text.slice(dashIdx + 3).match(/^(\d{1,2}:\d{2}\s*[AP]M)(\+\d)?/i)
+    if (arrM) arrTime = arrM[1].trim() + (arrM[2] || '')
+  }
+
+  // Duration: first "N hr M min" or "N hr"
+  const durM = text.match(/(\d+)\s*hr(?:\s*(\d+)\s*min)?/)
+  const duration = durM ? `${durM[1]}h${durM[2] ? ` ${durM[2]}m` : ''}` : null
+
+  // Stops
+  const stopsM = text.match(/Nonstop|\d+\s*stop/i)
+  const stops = stopsM ? stopsM[0] : null
+
+  // Airline: appears right after the arrival date "Day, Mon DD" and before the duration
+  // e.g. "...Wed, Apr 29Cathay Pacific8 hr..." or "...Thu, Apr 30Qantas, Cathay Pacific13 hr..."
+  const airlineM = text.match(/(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun),\s+\w+\s+\d+([^0-9]+?)(?=\d+\s*hr)/)
+  const airline = airlineM ? airlineM[1].trim().replace(/^[\s,–-]+|[\s,–-]+$/g, '') : null
+
+  // Price: first A$N,NNN
+  const priceM = text.match(/A\$([\d,]+)/)
+  const price = priceM ? parseInt(priceM[1].replace(/,/g, '')) : null
+
+  return { airline, depTime, arrTime, duration, stops, price }
+}
+
 /* ─────── TRAVEL START DATE HELPERS ─────── */
 // Returns a resolved date string for PREVIEW purposes only.
 // For 'relative' mode the daemon recomputes at run time.
@@ -234,6 +272,12 @@ export default function FlightSearchApp({ session }) {
   const [snapshots, setSnapshots] = useState([])
   const [loadingSnap, setLoadingSnap] = useState(false)
   const [expandedRun, setExpandedRun] = useState(null)
+  const [expandedShiftIds, setExpandedShiftIds] = useState(new Set())
+  const [shareModalId, setShareModalId] = useState(null)
+  const [shareLinkCopied, setShareLinkCopied] = useState(false)
+  const [sharedTokenInput, setSharedTokenInput] = useState('')
+  const [sharedViewData, setSharedViewData] = useState(null)
+  const [loadingSharedView, setLoadingSharedView] = useState(false)
 
   const notify = (m) => { setToast(m); setTimeout(() => setToast(''), 3500) }
   const ask = (msg, fn) => setConfirmDlg({ msg, fn })
@@ -443,6 +487,50 @@ export default function FlightSearchApp({ session }) {
     notify('Deleted')
   }
 
+  /* ── Share functions ── */
+  const toggleShiftExpand = (id) => {
+    setExpandedShiftIds(prev => {
+      const s = new Set(prev)
+      s.has(id) ? s.delete(id) : s.add(id)
+      return s
+    })
+  }
+
+  const generateShareToken = async (searchId) => {
+    const token = crypto.randomUUID()
+    const { error } = await supabase.from('tracked_searches')
+      .update({ share_token: token }).eq('id', searchId)
+    if (!error) {
+      setSearches(prev => prev.map(s => s.id === searchId ? { ...s, share_token: token } : s))
+      notify('Share link generated!')
+    } else notify('Error: ' + error.message)
+  }
+
+  const revokeShare = async (searchId) => {
+    const { error } = await supabase.from('tracked_searches')
+      .update({ share_token: null }).eq('id', searchId)
+    if (!error) {
+      setSearches(prev => prev.map(s => s.id === searchId ? { ...s, share_token: null } : s))
+      setShareModalId(null)
+      notify('Sharing revoked')
+    } else notify('Error: ' + error.message)
+  }
+
+  const loadSharedView = useCallback(async (tokenOrUrl) => {
+    let token = (tokenOrUrl || '').trim()
+    try { const u = new URL(token); token = u.searchParams.get('share') || token } catch {}
+    if (!token) return notify('Invalid share link')
+    setLoadingSharedView(true)
+    const { data: search } = await supabase
+      .rpc('get_search_by_share_token', { p_token: token })
+      .maybeSingle()
+    if (!search) { setLoadingSharedView(false); return notify('Shared search not found') }
+    const { data: snaps } = await supabase
+      .rpc('get_snapshots_by_share_token', { p_token: token })
+    setSharedViewData({ search, snapshots: snaps || [] })
+    setLoadingSharedView(false)
+  }, [])
+
   /* ── Computed: runs ── */
   const runs = useMemo(() => {
     if (!snapshots.length) return []
@@ -477,6 +565,13 @@ export default function FlightSearchApp({ session }) {
   , [runs])
 
   const selSearch = useMemo(() => searches.find(s => s.id === selSearchId), [searches, selSearchId])
+
+  /* ── URL share param on mount ── */
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    const token = new URLSearchParams(window.location.search).get('share')
+    if (token) { setSharedTokenInput(token); setTab('results'); loadSharedView(token) }
+  }, [loadSharedView])
 
   /* ── Loading ── */
   if (isLoading) return (
@@ -674,6 +769,47 @@ export default function FlightSearchApp({ session }) {
         </div>
       )}
 
+      {/* Share Modal */}
+      {shareModalId && (() => {
+        const s = searches.find(x => x.id === shareModalId)
+        if (!s) return null
+        const link = s.share_token ? `${typeof window !== 'undefined' ? window.location.origin + window.location.pathname : ''}?share=${s.share_token}` : null
+        return (
+          <div className="fixed inset-0 z-50 flex items-center justify-center" style={{ background: 'rgba(0,0,0,0.5)' }}>
+            <div className="mx-4 max-w-sm w-full p-6 rounded-2xl space-y-4" style={{ background: '#FAFAF5', fontFamily: mono }}>
+              <div className="flex items-center justify-between">
+                <p className={`${B} font-bold tracking-[0.1em] uppercase`}>Share Results</p>
+                <button onClick={() => { setShareModalId(null); setShareLinkCopied(false) }} className={`${B} opacity-25 hover:opacity-100`}>✕</button>
+              </div>
+              <p className={`${B} opacity-50 leading-relaxed`}>{s.name}</p>
+              {!link ? (
+                <div className="space-y-3">
+                  <p className={`${B} opacity-40 text-[12px] leading-relaxed`}>
+                    Generate a link so others can view these results (read-only). They must be logged in to view.
+                  </p>
+                  <Btn onClick={() => generateShareToken(s.id)} variant="primary" className="w-full">Generate Share Link</Btn>
+                </div>
+              ) : (
+                <div className="space-y-3">
+                  <div className="bg-[#f0f0ea] rounded-xl px-3 py-2 break-all">
+                    <p className="text-[11px] opacity-50 font-mono leading-relaxed">{link}</p>
+                  </div>
+                  <div className="flex gap-2">
+                    <Btn onClick={() => { navigator.clipboard.writeText(link); setShareLinkCopied(true); setTimeout(() => setShareLinkCopied(false), 2000) }}
+                      variant="primary" className="flex-1">
+                      {shareLinkCopied ? '✓ Copied!' : 'Copy Link'}
+                    </Btn>
+                    <Btn onClick={() => ask('Revoke this share link? Anyone with the link will lose access.', () => revokeShare(s.id))} variant="danger">
+                      Revoke
+                    </Btn>
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+        )
+      })()}
+
       {/* Header */}
       <header>
         <div className="max-w-2xl mx-auto px-4 py-5 flex items-end justify-between gap-4">
@@ -861,6 +997,7 @@ export default function FlightSearchApp({ session }) {
                         {!isOneOff && <Btn onClick={() => toggleActive(s)}>{s.is_active ? 'Pause' : 'Resume'}</Btn>}
                         <Btn onClick={() => startEdit(s)} variant="ghost">Edit</Btn>
                         <Btn onClick={() => { setSelSearchId(s.id); setTab('results') }} variant="ghost">Results</Btn>
+                        <Btn onClick={() => { setShareModalId(s.id); setShareLinkCopied(false) }} variant="ghost">Share</Btn>
                         <div className="flex-1" />
                         <Btn onClick={() => ask(`Delete "${s.name}" and all its data?`, () => deleteSearch(s.id))} variant="danger">Delete</Btn>
                       </div>
@@ -985,9 +1122,113 @@ export default function FlightSearchApp({ session }) {
             </select>
           </div>
 
-          {!selSearchId && (
-            <div className="py-16 text-center">
-              <p className={`${B} tracking-[0.12em] uppercase opacity-20`}>Select a tracked search to view results</p>
+          {/* ── View Shared Search ── */}
+          <div>
+            <label className="text-[10px] tracking-[0.12em] uppercase opacity-40 font-bold block mb-1.5">View Shared Search</label>
+            <div className="flex gap-2">
+              <input
+                className={`flex-1 ${B} bg-[#f0f0ea] rounded-xl px-4 py-3 outline-none tracking-wide border-2 border-transparent focus:border-[#222] transition-colors`}
+                placeholder="Paste share link or token..."
+                value={sharedTokenInput}
+                onChange={e => setSharedTokenInput(e.target.value)}
+                onKeyDown={e => e.key === 'Enter' && loadSharedView(sharedTokenInput)}
+              />
+              <Btn onClick={() => loadSharedView(sharedTokenInput)} disabled={loadingSharedView}>
+                {loadingSharedView ? '...' : 'Load'}
+              </Btn>
+              {sharedViewData && <Btn onClick={() => { setSharedViewData(null); setSharedTokenInput('') }}>Clear</Btn>}
+            </div>
+          </div>
+
+          {/* ── Shared View Results ── */}
+          {sharedViewData && (() => {
+            const sv = sharedViewData.search
+            const svSnaps = sharedViewData.snapshots
+            const svRuns = (() => {
+              const map = {}
+              for (const s of svSnaps) { if (!map[s.run_id]) map[s.run_id] = []; map[s.run_id].push(s) }
+              return Object.entries(map).map(([rid, items]) => {
+                const sorted = items.sort((a, b) => a.shift_index - b.shift_index)
+                const prices = sorted.filter(i => i.cheapest_price).map(i => i.cheapest_price)
+                return { runId: rid, items: sorted, time: sorted[0].scraped_at, cheapest: prices.length ? Math.min(...prices) : null }
+              }).sort((a, b) => new Date(b.time) - new Date(a.time))
+            })()
+            return (
+              <Card>
+                <div className="px-5 py-4 space-y-3">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <span className={`${B} font-bold uppercase`}>{sv.name}</span>
+                    <span className="text-[11px] px-2 py-0.5 rounded-full font-bold uppercase tracking-wider bg-blue-100 text-blue-700">Shared</span>
+                  </div>
+                  <p className={`${B} opacity-40`}>{sv.parsed_legs?.map(l => `${l.from}→${l.to}`).join(' · ')}</p>
+                  {svRuns.length === 0 && <p className={`${B} opacity-25`}>No results yet</p>}
+                  {svRuns.length > 0 && (
+                    <div className="space-y-2">
+                      <p className={`text-[10px] tracking-[0.12em] uppercase opacity-40 font-bold`}>Latest Run — {fmtDateTime(svRuns[0].time)}</p>
+                      {svRuns[0].items.map(item => {
+                        const isBest = item.cheapest_price === svRuns[0].cheapest && item.cheapest_price
+                        const isExp = expandedShiftIds.has('sv_' + item.id)
+                        const flights = Array.isArray(item.flights_raw) ? item.flights_raw : []
+                        return (
+                          <div key={item.id} className={`rounded-xl overflow-hidden ${isBest ? 'bg-emerald-50' : 'bg-[#f8f8f4]'}`}>
+                            <div className="flex items-center justify-between py-2 px-3">
+                              <div className="min-w-0 flex-1">
+                                <span className={`${B} font-bold tabular-nums`}>{item.shift_label}</span>
+                                <span className={`${B} opacity-40 ml-2 tabular-nums`}>{item.shifted_dates?.map(d => fmtDate(d)).join(' · ')}</span>
+                              </div>
+                              <div className="flex items-center gap-2">
+                                <span className={`text-[18px] font-bold tabular-nums ${isBest ? 'text-emerald-700' : ''}`}>
+                                  {item.cheapest_price ? `A$${item.cheapest_price.toLocaleString()}` : '—'}
+                                </span>
+                                {flights.length > 0 && (
+                                  <button onClick={() => toggleShiftExpand('sv_' + item.id)}
+                                    className={`text-[11px] tracking-[0.06em] uppercase px-2 py-1 rounded-lg transition-all ${isExp ? 'bg-[#ddd] opacity-80' : 'opacity-30 hover:opacity-70'}`}>
+                                    {isExp ? '▲' : `▼ ${flights.length}`}
+                                  </button>
+                                )}
+                              </div>
+                            </div>
+                            {isExp && (
+                              <div className={`px-3 pb-3 pt-1 border-t ${isBest ? 'border-emerald-100' : 'border-[#ebebeb]'} space-y-1`}>
+                                {flights.map((raw, fi) => {
+                                  const f = parseFlightSnippet(raw)
+                                  return (
+                                    <div key={fi} className="flex flex-wrap items-baseline gap-x-3 gap-y-0 py-1 border-b border-[#eee] last:border-0">
+                                      {f?.airline && <span className={`${B} font-bold opacity-80`}>{f.airline}</span>}
+                                      {f?.depTime && <span className={`${B} tabular-nums opacity-60`}>{f.depTime} – {f.arrTime}</span>}
+                                      {f?.duration && <span className="text-[12px] opacity-40">{f.duration}</span>}
+                                      {f?.stops && <span className={`text-[12px] ${f.stops === 'Nonstop' ? 'text-emerald-600 opacity-80' : 'opacity-50'}`}>{f.stops}</span>}
+                                      {f?.price && <span className={`${B} font-bold ml-auto tabular-nums`}>A${f.price.toLocaleString()}</span>}
+                                    </div>
+                                  )
+                                })}
+                                {item.url_used && (
+                                  <a href={item.url_used} target="_blank" rel="noopener noreferrer"
+                                    className="inline-block mt-1 text-[11px] tracking-[0.06em] uppercase opacity-40 hover:opacity-80 underline underline-offset-2 transition-opacity">
+                                    Open on Google Flights ↗
+                                  </a>
+                                )}
+                              </div>
+                            )}
+                          </div>
+                        )
+                      })}
+                      {svRuns[0].cheapest && (
+                        <div className="pt-2 border-t border-[#f0f0ea] flex items-center justify-between">
+                          <span className={`${B} tracking-[0.1em] uppercase opacity-40`}>Best Price</span>
+                          <span className="text-[28px] font-bold tabular-nums text-emerald-700">A${svRuns[0].cheapest.toLocaleString()}</span>
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+              </Card>
+            )
+          })()}
+
+          {!selSearchId && !sharedViewData && (
+            <div className="py-8 text-center">
+              <p className={`${B} tracking-[0.12em] uppercase opacity-20`}>Select a tracked search or load a shared link</p>
             </div>
           )}
 
@@ -1013,17 +1254,52 @@ export default function FlightSearchApp({ session }) {
                   <div className="space-y-1.5">
                     {runs[0].items.map(item => {
                       const isBest = item.cheapest_price === runs[0].cheapest && item.cheapest_price
+                      const isExp = expandedShiftIds.has(item.id)
+                      const flights = Array.isArray(item.flights_raw) ? item.flights_raw : []
                       return (
-                        <div key={item.id} className={`flex items-center justify-between py-2 px-3 rounded-xl ${isBest ? 'bg-emerald-50' : 'bg-[#f8f8f4]'}`}>
-                          <div className="min-w-0 flex-1">
-                            <span className={`${B} font-bold tabular-nums`}>{item.shift_label}</span>
-                            <span className={`${B} opacity-40 ml-2 tabular-nums`}>
-                              {item.shifted_dates?.map(d => fmtDate(d)).join(' · ')}
-                            </span>
+                        <div key={item.id} className={`rounded-xl overflow-hidden ${isBest ? 'bg-emerald-50' : 'bg-[#f8f8f4]'}`}>
+                          <div className="flex items-center justify-between py-2 px-3">
+                            <div className="min-w-0 flex-1">
+                              <span className={`${B} font-bold tabular-nums`}>{item.shift_label}</span>
+                              <span className={`${B} opacity-40 ml-2 tabular-nums`}>
+                                {item.shifted_dates?.map(d => fmtDate(d)).join(' · ')}
+                              </span>
+                            </div>
+                            <div className="flex items-center gap-2">
+                              <span className={`text-[18px] font-bold tabular-nums ${isBest ? 'text-emerald-700' : ''}`}>
+                                {item.cheapest_price ? `A$${item.cheapest_price.toLocaleString()}` : '—'}
+                              </span>
+                              {flights.length > 0 && (
+                                <button onClick={() => toggleShiftExpand(item.id)}
+                                  className={`text-[11px] tracking-[0.06em] uppercase px-2 py-1 rounded-lg transition-all ${isExp ? 'bg-[#ddd] opacity-80' : 'opacity-30 hover:opacity-70'}`}>
+                                  {isExp ? '▲' : `▼ ${flights.length}`}
+                                </button>
+                              )}
+                            </div>
                           </div>
-                          <span className={`text-[18px] font-bold tabular-nums ml-3 ${isBest ? 'text-emerald-700' : ''}`}>
-                            {item.cheapest_price ? `A$${item.cheapest_price.toLocaleString()}` : '—'}
-                          </span>
+                          {isExp && (
+                            <div className={`px-3 pb-3 pt-1 border-t ${isBest ? 'border-emerald-100' : 'border-[#ebebeb]'} space-y-1`}>
+                              {flights.map((raw, fi) => {
+                                const f = parseFlightSnippet(raw)
+                                return (
+                                  <div key={fi} className="flex flex-wrap items-baseline gap-x-3 gap-y-0 py-1 border-b border-[#eee] last:border-0">
+                                    {f?.airline && <span className={`${B} font-bold opacity-80`}>{f.airline}</span>}
+                                    {f?.depTime && <span className={`${B} tabular-nums opacity-60`}>{f.depTime} – {f.arrTime}</span>}
+                                    {f?.duration && <span className="text-[12px] opacity-40">{f.duration}</span>}
+                                    {f?.stops && <span className={`text-[12px] ${f.stops === 'Nonstop' ? 'text-emerald-600 opacity-80' : 'opacity-50'}`}>{f.stops}</span>}
+                                    {f?.price && <span className={`${B} font-bold ml-auto tabular-nums`}>A${f.price.toLocaleString()}</span>}
+                                    {!f?.airline && !f?.depTime && <span className="text-[11px] opacity-30 font-mono">{raw.slice(0, 80)}</span>}
+                                  </div>
+                                )
+                              })}
+                              {item.url_used && (
+                                <a href={item.url_used} target="_blank" rel="noopener noreferrer"
+                                  className="inline-block mt-1 text-[11px] tracking-[0.06em] uppercase opacity-40 hover:opacity-80 underline underline-offset-2 transition-opacity">
+                                  Open on Google Flights ↗
+                                </a>
+                              )}
+                            </div>
+                          )}
                         </div>
                       )
                     })}
@@ -1102,18 +1378,55 @@ export default function FlightSearchApp({ session }) {
                         </button>
                         {isExp && (
                           <div className="px-5 pb-4 space-y-1.5 border-t border-[#f0f0ea] pt-3">
-                            {r.items.map(item => (
-                              <div key={item.id} className="bg-[#f8f8f4] rounded-xl px-4 py-2.5">
-                                <div className="flex items-center justify-between flex-wrap gap-1">
-                                  <div>
-                                    <span className={`${B} font-bold tabular-nums`}>{item.shift_label}</span>
-                                    <span className={`${B} opacity-30 ml-2`}>{item.result_count} result{item.result_count !== 1 ? 's' : ''}</span>
+                            {r.items.map(item => {
+                              const isShiftExp = expandedShiftIds.has(item.id)
+                              const flights = Array.isArray(item.flights_raw) ? item.flights_raw : []
+                              return (
+                                <div key={item.id} className="bg-[#f8f8f4] rounded-xl overflow-hidden">
+                                  <div className="px-4 py-2.5">
+                                    <div className="flex items-center justify-between flex-wrap gap-1">
+                                      <div>
+                                        <span className={`${B} font-bold tabular-nums`}>{item.shift_label}</span>
+                                        <span className={`${B} opacity-30 ml-2`}>{item.result_count} result{item.result_count !== 1 ? 's' : ''}</span>
+                                      </div>
+                                      <div className="flex items-center gap-2">
+                                        <span className={`${B} font-bold tabular-nums`}>{item.cheapest_price ? `A$${item.cheapest_price.toLocaleString()}` : '—'}</span>
+                                        {flights.length > 0 && (
+                                          <button onClick={() => toggleShiftExpand(item.id)}
+                                            className={`text-[11px] tracking-[0.06em] uppercase px-2 py-1 rounded-lg transition-all ${isShiftExp ? 'bg-[#ddd] opacity-80' : 'opacity-30 hover:opacity-70'}`}>
+                                            {isShiftExp ? '▲' : `▼ ${flights.length}`}
+                                          </button>
+                                        )}
+                                      </div>
+                                    </div>
+                                    <p className={`${B} opacity-25 mt-0.5 tabular-nums`}>{item.shifted_dates?.join(' · ')}</p>
                                   </div>
-                                  <span className={`${B} font-bold tabular-nums`}>{item.cheapest_price ? `A$${item.cheapest_price.toLocaleString()}` : '—'}</span>
+                                  {isShiftExp && (
+                                    <div className="px-4 pb-3 pt-1 border-t border-[#ebebeb] space-y-1">
+                                      {flights.map((raw, fi) => {
+                                        const f = parseFlightSnippet(raw)
+                                        return (
+                                          <div key={fi} className="flex flex-wrap items-baseline gap-x-3 gap-y-0 py-1 border-b border-[#eee] last:border-0">
+                                            {f?.airline && <span className={`${B} font-bold opacity-80`}>{f.airline}</span>}
+                                            {f?.depTime && <span className={`${B} tabular-nums opacity-60`}>{f.depTime} – {f.arrTime}</span>}
+                                            {f?.duration && <span className="text-[12px] opacity-40">{f.duration}</span>}
+                                            {f?.stops && <span className={`text-[12px] ${f.stops === 'Nonstop' ? 'text-emerald-600 opacity-80' : 'opacity-50'}`}>{f.stops}</span>}
+                                            {f?.price && <span className={`${B} font-bold ml-auto tabular-nums`}>A${f.price.toLocaleString()}</span>}
+                                            {!f?.airline && !f?.depTime && <span className="text-[11px] opacity-30 font-mono">{raw.slice(0, 80)}</span>}
+                                          </div>
+                                        )
+                                      })}
+                                      {item.url_used && (
+                                        <a href={item.url_used} target="_blank" rel="noopener noreferrer"
+                                          className="inline-block mt-1 text-[11px] tracking-[0.06em] uppercase opacity-40 hover:opacity-80 underline underline-offset-2 transition-opacity">
+                                          Open on Google Flights ↗
+                                        </a>
+                                      )}
+                                    </div>
+                                  )}
                                 </div>
-                                <p className={`${B} opacity-25 mt-0.5 tabular-nums`}>{item.shifted_dates?.join(' · ')}</p>
-                              </div>
-                            ))}
+                              )
+                            })}
                           </div>
                         )}
                       </Card>
