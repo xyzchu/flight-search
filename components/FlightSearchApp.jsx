@@ -1,3 +1,4 @@
+// supabase account rsychu@gmail.com
 'use client'
 import React, { useState, useEffect, useMemo, useCallback } from 'react'
 import { supabase } from '@/lib/supabase'
@@ -82,6 +83,11 @@ const timeUntil = (d) => {
   const h = Math.floor(m / 60)
   if (h < 24) return `in ${h}h`
   return `in ${Math.floor(h / 24)}d`
+}
+
+const normalizePositiveInt = (value, fallback = 1) => {
+  const parsed = Number.parseInt(value, 10)
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback
 }
 
 /* ─────── FLIGHT SNIPPET PARSER ─────── */
@@ -367,6 +373,9 @@ export default function FlightSearchApp({ session }) {
   const saveSearch = async () => {
     if (!fParsed) return notify('Paste a valid Google Flights URL')
     if (!fName.trim()) return notify('Enter a name')
+    if (fStartMode === 'custom' && !fTravelStart) return notify('Choose a fixed departure date')
+    if (!fOneOff && fHasEndDate && !fStopDate) return notify('Choose a stop date or switch to no end date')
+    if (!fOneOff && fSchedDays < 1) return notify('Re-check interval must be at least 1 day')
     setSaving(true)
     const { data, error } = await supabase
       .from('tracked_searches')
@@ -382,7 +391,7 @@ export default function FlightSearchApp({ session }) {
         shift_start: fShiftStart,
         shift_end: fShiftEnd,
         shift_step_days: fStepDays,
-        schedule_interval_days: fOneOff ? 0 : fSchedDays,
+        schedule_interval_days: fOneOff ? 0 : normalizePositiveInt(fSchedDays),
         stop_date: fOneOff ? null : (fHasEndDate ? fStopDate || null : null),
         is_active: true,
         next_run_at: new Date().toISOString(),
@@ -436,9 +445,16 @@ export default function FlightSearchApp({ session }) {
   }
 
   const saveEdit = async () => {
+    if (!eFields.name?.trim()) return notify('Enter a name')
+    if (!eUrlParsed) return notify('Paste a valid Google Flights URL before saving')
+    if (eFields.startMode === 'custom' && !eFields.travelStart) return notify('Choose a fixed departure date')
+    if (!eFields.oneoff && eFields.hasEndDate && !eFields.stop_date) return notify('Choose a stop date or switch to no end date')
+    if (!eFields.oneoff && normalizePositiveInt(eFields.schedule_interval_days, 0) < 1) {
+      return notify('Re-check interval must be at least 1 day')
+    }
     setESaving(true)
     const upd = {
-      name: eFields.name,
+      name: eFields.name.trim(),
       base_url: eFields.base_url,
       parsed_legs: eUrlParsed?.legs || [],
       base_dates: eUrlParsed?.dates || [],
@@ -448,7 +464,7 @@ export default function FlightSearchApp({ session }) {
       shift_start: eFields.shift_start,
       shift_end: eFields.shift_end,
       shift_step_days: eFields.shift_step_days,
-      schedule_interval_days: eFields.oneoff ? 0 : eFields.schedule_interval_days,
+      schedule_interval_days: eFields.oneoff ? 0 : normalizePositiveInt(eFields.schedule_interval_days),
       stop_date: eFields.oneoff ? null : (eFields.hasEndDate ? eFields.stop_date || null : null),
     }
     const { error } = await supabase.from('tracked_searches').update(upd).eq('id', editingId)
@@ -520,13 +536,22 @@ export default function FlightSearchApp({ session }) {
     let token = (tokenOrUrl || '').trim()
     try { const u = new URL(token); token = u.searchParams.get('share') || token } catch {}
     if (!token) return notify('Invalid share link')
+    setSharedViewData(null)
     setLoadingSharedView(true)
-    const { data: search } = await supabase
+    const { data: search, error: searchError } = await supabase
       .rpc('get_search_by_share_token', { p_token: token })
       .maybeSingle()
+    if (searchError) {
+      setLoadingSharedView(false)
+      return notify('Error: ' + searchError.message)
+    }
     if (!search) { setLoadingSharedView(false); return notify('Shared search not found') }
-    const { data: snaps } = await supabase
+    const { data: snaps, error: snapsError } = await supabase
       .rpc('get_snapshots_by_share_token', { p_token: token })
+    if (snapsError) {
+      setLoadingSharedView(false)
+      return notify('Error: ' + snapsError.message)
+    }
     setSharedViewData({ search, snapshots: snaps || [] })
     setLoadingSharedView(false)
   }, [])
@@ -925,13 +950,13 @@ export default function FlightSearchApp({ session }) {
                       <Toggle label="One-off (run once, don't repeat)" checked={fOneOff} onChange={setFOneOff} />
                     </div>
 
-                    {!fOneOff && (
-                      <div className="space-y-3">
-                        <Input label="Re-check every (days)" type="number" value={fSchedDays} onChange={setFSchedDays} />
-                        <EndDatePicker
-                          hasEnd={fHasEndDate}
-                          onHasEndChange={setFHasEndDate}
-                          date={fStopDate}
+                      {!fOneOff && (
+                        <div className="space-y-3">
+                        <Input label="Re-check every (days)" type="number" value={fSchedDays} onChange={v => setFSchedDays(normalizePositiveInt(v))} />
+                         <EndDatePicker
+                           hasEnd={fHasEndDate}
+                           onHasEndChange={setFHasEndDate}
+                           date={fStopDate}
                           onDateChange={setFStopDate}
                         />
                       </div>
@@ -1078,7 +1103,7 @@ export default function FlightSearchApp({ session }) {
 
                       {!eFields.oneoff && (
                         <div className="space-y-3">
-                          <Input label="Re-check every (days)" type="number" value={eFields.schedule_interval_days} onChange={v => updateE('schedule_interval_days', v)} />
+                          <Input label="Re-check every (days)" type="number" value={eFields.schedule_interval_days} onChange={v => updateE('schedule_interval_days', normalizePositiveInt(v))} />
                           <EndDatePicker
                             hasEnd={eFields.hasEndDate}
                             onHasEndChange={v => updateE('hasEndDate', v)}

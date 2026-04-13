@@ -10,6 +10,7 @@ const CHECK_MINS = parseInt(process.env.CHECK_INTERVAL_MINUTES || '30', 10);
 const RUN_ONCE = process.argv.includes('--once');
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
+let cycleInProgress = false;
 
 function delay(ms) { return new Promise(r => setTimeout(r, ms)); }
 const log = (msg) => console.log(`[${new Date().toISOString()}] ${msg}`);
@@ -47,10 +48,15 @@ function findDatesInBuffer(buf) {
 
 function shiftUrl(baseUrl, shiftDays) {
   const tfs = extractTfs(baseUrl);
-  if (!tfs) return baseUrl;
+  if (!tfs) {
+    throw new Error('Base URL is missing a tfs parameter');
+  }
 
   const buf = b64urlDecode(tfs);
   const dates = findDatesInBuffer(buf);
+  if (!dates.length) {
+    throw new Error('Base URL tfs payload did not contain any travel dates');
+  }
 
   const shiftedDates = [];
   for (const d of dates) {
@@ -108,6 +114,26 @@ function cheapestPrice(flights) {
   return best;
 }
 
+function parseDateOnly(value) {
+  if (!value) return null;
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
+  if (!match) return null;
+  const [, year, month, day] = match;
+  return new Date(Number(year), Number(month) - 1, Number(day));
+}
+
+function startOfTodayLocal() {
+  const now = new Date();
+  return new Date(now.getFullYear(), now.getMonth(), now.getDate());
+}
+
+function hasStopDatePassed(stopDate) {
+  const stopDay = parseDateOnly(stopDate);
+  if (!stopDay) return false;
+  stopDay.setDate(stopDay.getDate() + 1);
+  return startOfTodayLocal() >= stopDay;
+}
+
 /* ─── Compute base offset from travel date settings ─── */
 function computeBaseOffset(job) {
   // Determine mode: use saved mode, or infer from old records
@@ -139,13 +165,20 @@ function computeBaseOffset(job) {
 }
 
 /* ─── Job Runner ─── */
+/* ─── Job Runner ─── */
 async function runJob(page, job) {
   const runId = `run_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
   const { shift_start = 0, shift_end = 4, shift_step_days = 7 } = job;
 
+  if (!job.base_url) {
+    throw new Error('Tracked search is missing a base URL');
+  }
+
   const baseOffset = computeBaseOffset(job);
 
   log(`  Job: "${job.name}" | Shifts ${shift_start}→${shift_end} × ${shift_step_days}d${baseOffset ? ` | Base offset: ${baseOffset}d` : ''}`);
+
+  const failedShifts = []; // collect shifts that got no price
 
   for (let i = shift_start; i <= shift_end; i++) {
     const days = baseOffset + (i * shift_step_days);
@@ -183,6 +216,10 @@ async function runJob(page, job) {
         result_count: flights.length,
         url_used: shiftedUrl,
       });
+
+      if (price === null) {
+        failedShifts.push({ shiftIndex: i, days, shiftedUrl, shiftedDates });
+      }
     } catch (err) {
       log(`      ERROR: ${err.message}`);
       await supabase.from('price_snapshots').insert({
@@ -194,9 +231,10 @@ async function runJob(page, job) {
         shift_label: `+${i} (${days}d)`,
         shifted_dates: [],
         cheapest_price: null,
-        flights_raw: [{ error: err.message }],
+        flights_raw: [`ERROR: ${err.message}`],
         result_count: 0,
       });
+      failedShifts.push({ shiftIndex: i, days, shiftedDates: [] });
     }
 
     const wait = 15000 + Math.random() * 15000;
@@ -204,88 +242,170 @@ async function runJob(page, job) {
     await delay(wait);
   }
 
+  // ─── Retry pass for shifts that got no price ───
+  if (failedShifts.length > 0) {
+    log(`  🔄 Retrying ${failedShifts.length} failed shift(s): [${failedShifts.map(s => s.shiftIndex).join(', ')}]`);
+
+    for (const shift of failedShifts) {
+      const { shiftIndex, days, shiftedDates } = shift;
+
+      log(`    🔄 Retry shift +${shiftIndex} (+${days}d): ${shiftedDates.length ? shiftedDates.join(' / ') : 'dates unavailable'}`);
+
+      try {
+        const { url: shiftedUrl } = shiftUrl(job.base_url, days);
+        await page.goto(shiftedUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+        let found = await waitForResults(page, 35000);
+
+        if (!found) {
+          log(`      No results on retry — reloading...`);
+          await page.reload({ waitUntil: 'domcontentloaded', timeout: 60000 });
+          found = await waitForResults(page, 25000);
+        }
+
+        await delay(3000);
+        const flights = await extractFlights(page);
+        const price = cheapestPrice(flights);
+
+        if (price !== null) {
+          log(`      ✅ Retry succeeded: A$${price}`);
+          const { error: updateErr } = await supabase
+            .from('price_snapshots')
+            .update({
+              cheapest_price: price,
+              flights_raw: flights,
+              result_count: flights.length,
+              url_used: shiftedUrl,
+              scraped_at: new Date().toISOString(),
+            })
+            .eq('run_id', runId)
+            .eq('shift_index', shiftIndex);
+
+          if (updateErr) {
+            log(`      ❌ DB update failed: ${updateErr.message}`);
+          }
+        } else {
+          log(`      ❌ Retry still no price — keeping null`);
+        }
+      } catch (err) {
+        log(`      ❌ Retry error: ${err.message}`);
+      }
+
+      const wait = 15000 + Math.random() * 15000;
+      log(`      Waiting ${Math.round(wait / 1000)}s...`);
+      await delay(wait);
+    }
+  }
+
   return runId;
 }
 
 /* ─── Main Check Cycle ─── */
 async function checkAndRun() {
-  log('Checking for due jobs...');
-
-  const now = new Date().toISOString();
-  const { data: jobs, error } = await supabase
-    .from('tracked_searches')
-    .select('*')
-    .eq('is_active', true)
-    .lte('next_run_at', now)
-    .order('next_run_at', { ascending: true });
-
-  if (error) { log(`DB error: ${error.message}`); return; }
-  if (!jobs?.length) { log('No jobs due.'); return; }
-
-  log(`Found ${jobs.length} job(s) to run.`);
-
-  const profileDir = path.join(__dirname, '.browser-profile');
-  let context;
-  try {
-    context = await chromium.launchPersistentContext(profileDir, {
-      headless: false,
-      args: [
-        '--disable-blink-features=AutomationControlled',
-        '--no-sandbox',
-        '--disable-dev-shm-usage',
-      ],
-      ignoreDefaultArgs: ['--enable-automation'],
-      viewport: { width: 1366, height: 900 },
-      locale: 'en-AU',
-      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-    });
-  } catch (err) {
-    log(`Browser launch failed: ${err.message}`);
+  if (cycleInProgress) {
+    log('Previous cycle still running; skipping this tick.');
     return;
   }
+  cycleInProgress = true;
+  log('Checking for due jobs...');
 
-  const page = context.pages()[0] || await context.newPage();
-  page.setDefaultTimeout(60000);
-  await page.addInitScript(() => {
-    Object.defineProperty(navigator, 'webdriver', { get: () => false });
-  });
+  try {
+    const now = new Date().toISOString();
+    const { data: jobs, error } = await supabase
+      .from('tracked_searches')
+      .select('*')
+      .eq('is_active', true)
+      .lte('next_run_at', now)
+      .order('next_run_at', { ascending: true });
 
-  for (const job of jobs) {
-    if (job.stop_date && new Date() >= new Date(job.stop_date)) {
-      log(`  "${job.name}" past stop date — deactivating.`);
-      await supabase.from('tracked_searches')
-        .update({ is_active: false })
-        .eq('id', job.id);
-      continue;
-    }
+    if (error) { log(`DB error: ${error.message}`); return; }
+    if (!jobs?.length) { log('No jobs due.'); return; }
 
+    log(`Found ${jobs.length} job(s) to run.`);
+
+    const profileDir = path.join(__dirname, '.browser-profile');
+    let context;
     try {
-      await runJob(page, job);
+      context = await chromium.launchPersistentContext(profileDir, {
+        headless: false,
+        args: [
+          '--disable-blink-features=AutomationControlled',
+          '--no-sandbox',
+          '--disable-dev-shm-usage',
+        ],
+        ignoreDefaultArgs: ['--enable-automation'],
+        viewport: { width: 1366, height: 900 },
+        locale: 'en-AU',
+        userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+      });
     } catch (err) {
-      log(`  Job "${job.name}" failed: ${err.message}`);
+      log(`Browser launch failed: ${err.message}`);
+      return;
     }
 
-    const nowIso = new Date().toISOString();
+    const page = context.pages()[0] || await context.newPage();
+    page.setDefaultTimeout(60000);
+    await page.addInitScript(() => {
+      Object.defineProperty(navigator, 'webdriver', { get: () => false });
+    });
 
-    if ((job.schedule_interval_days || 0) === 0) {
-      log(`  "${job.name}" is one-off — marking complete.`);
-      await supabase.from('tracked_searches')
-        .update({ last_run_at: nowIso, is_active: false })
-        .eq('id', job.id);
-    } else {
-      const next = new Date();
-      next.setDate(next.getDate() + (job.schedule_interval_days || 1));
-      await supabase.from('tracked_searches')
-        .update({ last_run_at: nowIso, next_run_at: next.toISOString() })
-        .eq('id', job.id);
-      log(`  Next run for "${job.name}": ${next.toISOString()}`);
+    for (const job of jobs) {
+      if (job.stop_date && hasStopDatePassed(job.stop_date)) {
+        log(`  "${job.name}" past stop date — deactivating.`);
+        await supabase.from('tracked_searches')
+          .update({ is_active: false })
+          .eq('id', job.id);
+        continue;
+      }
+
+      const claimTimestamp = new Date().toISOString();
+      const nextPlaceholder = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+      const { data: claimedJobs, error: claimError } = await supabase
+        .from('tracked_searches')
+        .update({ last_run_at: claimTimestamp, next_run_at: nextPlaceholder })
+        .eq('id', job.id)
+        .eq('is_active', true)
+        .eq('next_run_at', job.next_run_at)
+        .select('id');
+
+      if (claimError) {
+        log(`  Could not claim "${job.name}": ${claimError.message}`);
+        continue;
+      }
+      if (!claimedJobs?.length) {
+        log(`  Skipping "${job.name}" — another cycle already claimed it.`);
+        continue;
+      }
+
+      try {
+        await runJob(page, job);
+      } catch (err) {
+        log(`  Job "${job.name}" failed: ${err.message}`);
+      }
+
+      const nowIso = new Date().toISOString();
+
+      if ((job.schedule_interval_days || 0) === 0) {
+        log(`  "${job.name}" is one-off — marking complete.`);
+        await supabase.from('tracked_searches')
+          .update({ last_run_at: nowIso, is_active: false })
+          .eq('id', job.id);
+      } else {
+        const next = new Date();
+        next.setDate(next.getDate() + (job.schedule_interval_days || 1));
+        await supabase.from('tracked_searches')
+          .update({ last_run_at: nowIso, next_run_at: next.toISOString() })
+          .eq('id', job.id);
+        log(`  Next run for "${job.name}": ${next.toISOString()}`);
+      }
+
+      await delay(5000);
     }
 
-    await delay(5000);
+    await context.close();
+    log('All jobs done. Browser closed.');
+  } finally {
+    cycleInProgress = false;
   }
-
-  await context.close();
-  log('All jobs done. Browser closed.');
 }
 
 /* ─── Start ─── */
