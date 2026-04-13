@@ -8,6 +8,23 @@ import { APP_DEPLOYED_AT } from '@/lib/build-info'
 const mono = '"SF Mono","Fira Code","Cascadia Code","Consolas","Liberation Mono",monospace'
 const B = 'text-[14px]'
 const pad2 = (n) => String(n).padStart(2, '0')
+const parseDateOnly = (value) => {
+  if (!value) return null
+  const [y, m, d] = String(value).split('-').map(Number)
+  if (!y || !m || !d) return null
+  return new Date(y, m - 1, d)
+}
+const formatDateOnly = (value) => {
+  const d = value instanceof Date ? value : parseDateOnly(value)
+  if (!d) return ''
+  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`
+}
+const shiftDateOnly = (value, days) => {
+  const d = parseDateOnly(value)
+  if (!d) return value
+  d.setDate(d.getDate() + days)
+  return formatDateOnly(d)
+}
 
 /* ─────── AIRPORTS ─────── */
 const AIRPORTS = [
@@ -61,7 +78,7 @@ const airportLabel = (code) => {
   return a ? `${a.city} (${a.code})` : code
 }
 const fmtDate = (d) =>
-  new Date(d).toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' })
+  parseDateOnly(d)?.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' }) || ''
 const fmtDateTime = (d) =>
   new Date(d).toLocaleDateString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })
 const fmtDeployStamp = (d) =>
@@ -140,7 +157,7 @@ function getTravelStartDate(mode, relativeDays, customDate) {
   if (mode === 'relative') {
     const d = new Date()
     d.setDate(d.getDate() + (relativeDays || 0))
-    return d.toISOString().slice(0, 10)
+    return formatDateOnly(d)
   }
   if (mode === 'custom') return customDate || null
   return null // 'url' → no offset
@@ -148,14 +165,11 @@ function getTravelStartDate(mode, relativeDays, customDate) {
 
 function adjustBaseDates(baseDates, travelStartDate) {
   if (!travelStartDate || !baseDates?.length) return baseDates
-  const first = new Date(baseDates[0] + 'T00:00:00')
-  const target = new Date(travelStartDate + 'T00:00:00')
+  const first = parseDateOnly(baseDates[0])
+  const target = parseDateOnly(travelStartDate)
+  if (!first || !target) return baseDates
   const offset = Math.round((target - first) / 86400000)
-  return baseDates.map(d => {
-    const dt = new Date(d + 'T00:00:00')
-    dt.setDate(dt.getDate() + offset)
-    return dt.toISOString().slice(0, 10)
-  })
+  return baseDates.map(d => shiftDateOnly(d, offset))
 }
 
 /* ─────── URL PARSER — v4 ─────── */
@@ -240,11 +254,7 @@ function computeShiftPreview(baseDates, shiftStart, shiftEnd, stepDays) {
   const previews = []
   for (let i = shiftStart; i <= shiftEnd; i++) {
     const days = i * stepDays
-    const shifted = baseDates.map(d => {
-      const dt = new Date(d)
-      dt.setDate(dt.getDate() + days)
-      return dt.toISOString().slice(0, 10)
-    })
+    const shifted = baseDates.map(d => shiftDateOnly(d, days))
     previews.push({ shift: i, days, dates: shifted })
   }
   return previews
@@ -337,9 +347,7 @@ export default function FlightSearchApp({ session }) {
     const tsd = getTravelStartDate(fStartMode, fRelativeDays, fTravelStart)
     const adjusted = adjustBaseDates(fParsed.dates, tsd)
     if (adjusted?.length) {
-      const first = new Date(adjusted[0])
-      first.setDate(first.getDate() - 7)
-      setFStopDate(first.toISOString().slice(0, 10))
+      setFStopDate(shiftDateOnly(adjusted[0], -7))
     }
   }, [fParsed, fStartMode, fRelativeDays, fTravelStart, fHasEndDate, fOneOff])
 
