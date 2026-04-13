@@ -2,6 +2,7 @@
 'use client'
 import React, { useState, useEffect, useMemo, useCallback } from 'react'
 import { supabase } from '@/lib/supabase'
+import { APP_DEPLOYED_AT } from '@/lib/build-info'
 import {
   LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip as RTooltip,
   ResponsiveContainer, Legend,
@@ -68,6 +69,15 @@ const fmtDate = (d) =>
   new Date(d).toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' })
 const fmtDateTime = (d) =>
   new Date(d).toLocaleDateString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })
+const fmtDeployStamp = (d) =>
+  new Date(d).toLocaleString('en-AU', {
+    year: 'numeric',
+    month: 'short',
+    day: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  })
 const timeAgo = (d) => {
   const m = Math.floor((Date.now() - new Date(d).getTime()) / 60000)
   if (m < 60) return `${m}m ago`
@@ -1467,6 +1477,9 @@ export default function FlightSearchApp({ session }) {
       <footer className="max-w-2xl mx-auto px-4 py-8 text-center">
         <p className="text-[11px] tracking-[0.15em] uppercase opacity-20" style={{ fontFamily: mono }}>
           Flight Price Tracker · Daemon scrapes · UI displays
+        </p>
+        <p className="text-[11px] tracking-[0.12em] uppercase opacity-20 mt-2" style={{ fontFamily: mono }}>
+          Last Deploy · {fmtDeployStamp(APP_DEPLOYED_AT)}
         </p>
       </footer>
     </div>
