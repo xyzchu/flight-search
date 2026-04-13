@@ -666,6 +666,10 @@ export default function FlightSearchApp({ session }) {
     () => selectedRun?.items.find(item => item.id === selectedResultCell?.itemId) || null,
     [selectedRun, selectedResultCell]
   )
+  const selectedRowKey = useMemo(() => {
+    if (!selectedItem) return null
+    return String(selectedItem.shift_index ?? selectedItem.shift_label ?? selectedItem.id)
+  }, [selectedItem])
 
   useEffect(() => {
     if (!selectedResultCell) return
@@ -1375,47 +1379,54 @@ export default function FlightSearchApp({ session }) {
                       </thead>
                       <tbody>
                         {comparisonRows.map(row => (
-                          <tr key={row.key}>
-                            <td className="align-top py-3 pr-3 border-b border-[#f0f0ea]">
-                              <p className={`${B} font-bold tabular-nums`}>{row.firstDate ? fmtDate(row.firstDate) : row.shiftLabel}</p>
-                              <p className="text-[11px] opacity-25 mt-1 tabular-nums">{row.sampleDates?.join(' · ') || row.shiftLabel}</p>
-                            </td>
-                            {recentRuns.map(run => {
-                              const item = row.cells[run.runId]
-                              const selected = selectedResultCell?.runId === run.runId && selectedResultCell?.itemId === item?.id
-                              return (
-                                <td key={run.runId} className="align-top px-2 py-3 border-b border-[#f0f0ea]">
-                                  {item ? (
-                                    <button
-                                      onClick={() => setSelectedResultCell({ runId: run.runId, itemId: item.id })}
-                                      className={`w-full text-left rounded-xl px-3 py-3 transition-all ${selected ? 'bg-[#222] text-[#f5f5ee]' : 'bg-[#f8f8f4] hover:bg-[#efefe8]'}`}
-                                    >
-                                      <span className={`block ${B} font-bold tabular-nums`}>{item.cheapest_price ? `A$${item.cheapest_price.toLocaleString()}` : '—'}</span>
-                                      <span className={`block text-[10px] tracking-[0.08em] uppercase mt-1 ${selected ? 'opacity-70' : 'opacity-30'}`}>
-                                        {item.result_count} result{item.result_count !== 1 ? 's' : ''}
-                                      </span>
-                                    </button>
-                                  ) : (
-                                    <div className="w-full rounded-xl px-3 py-3 bg-[#fbfbf8] text-[12px] opacity-20 text-center">—</div>
-                                  )}
+                          <React.Fragment key={row.key}>
+                            <tr>
+                              <td className="align-top py-3 pr-3 border-b border-[#f0f0ea]">
+                                <p className={`${B} font-bold tabular-nums`}>{row.firstDate ? fmtDate(row.firstDate) : row.shiftLabel}</p>
+                                <p className="text-[11px] opacity-25 mt-1 tabular-nums">{row.sampleDates?.join(' · ') || row.shiftLabel}</p>
+                              </td>
+                              {recentRuns.map(run => {
+                                const item = row.cells[run.runId]
+                                const selected = selectedResultCell?.runId === run.runId && selectedResultCell?.itemId === item?.id
+                                return (
+                                  <td key={run.runId} className="align-top px-2 py-3 border-b border-[#f0f0ea]">
+                                    {item ? (
+                                      <button
+                                        onClick={() => setSelectedResultCell(selected ? null : { runId: run.runId, itemId: item.id })}
+                                        className={`w-full text-left rounded-xl px-3 py-3 transition-all ${selected ? 'bg-[#222] text-[#f5f5ee]' : 'bg-[#f8f8f4] hover:bg-[#efefe8]'}`}
+                                      >
+                                        <span className={`block ${B} font-bold tabular-nums`}>{item.cheapest_price ? `A$${item.cheapest_price.toLocaleString()}` : '—'}</span>
+                                        <span className={`block text-[10px] tracking-[0.08em] uppercase mt-1 ${selected ? 'opacity-70' : 'opacity-30'}`}>
+                                          {item.result_count} result{item.result_count !== 1 ? 's' : ''}
+                                        </span>
+                                      </button>
+                                    ) : (
+                                      <div className="w-full rounded-xl px-3 py-3 bg-[#fbfbf8] text-[12px] opacity-20 text-center">—</div>
+                                    )}
+                                  </td>
+                                )
+                              })}
+                            </tr>
+                            {selectedItem && selectedRowKey === row.key && (
+                              <tr>
+                                <td colSpan={recentRuns.length + 1} className="pt-0 pb-3 border-b border-[#f0f0ea]">
+                                  <div className="pt-3">
+                                    <ResultDetailCard
+                                      item={selectedItem}
+                                      runTime={selectedRun?.time}
+                                      onClose={() => setSelectedResultCell(null)}
+                                    />
+                                  </div>
                                 </td>
-                              )
-                            })}
-                          </tr>
+                              </tr>
+                            )}
+                          </React.Fragment>
                         ))}
                       </tbody>
                     </table>
                   </div>
                 </div>
               </Card>
-
-              {selectedItem && (
-                <ResultDetailCard
-                  item={selectedItem}
-                  runTime={selectedRun?.time}
-                  onClose={() => setSelectedResultCell(null)}
-                />
-              )}
             </>
           )}
         </div>
