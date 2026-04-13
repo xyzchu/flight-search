@@ -134,10 +134,14 @@ function hasStopDatePassed(stopDate) {
   return startOfTodayLocal() >= stopDay;
 }
 
+function getTravelDateMode(job) {
+  return job.travel_date_mode || (job.travel_start_date ? 'custom' : 'url');
+}
+
 /* ─── Compute base offset from travel date settings ─── */
 function computeBaseOffset(job) {
   // Determine mode: use saved mode, or infer from old records
-  const mode = job.travel_date_mode || (job.travel_start_date ? 'custom' : 'url');
+  const mode = getTravelDateMode(job);
 
   if (mode === 'relative' && job.base_dates?.length) {
     // Dynamic: today + N days
@@ -164,6 +168,23 @@ function computeBaseOffset(job) {
   return 0;
 }
 
+function computeEffectiveShiftStart(job) {
+  const requestedStart = job.shift_start ?? 0;
+  if (getTravelDateMode(job) !== 'custom' || !job.travel_start_date) {
+    return requestedStart;
+  }
+
+  const firstDeparture = parseDateOnly(job.travel_start_date);
+  if (!firstDeparture) return requestedStart;
+
+  const daysPast = Math.floor((startOfTodayLocal() - firstDeparture) / 86400000);
+  if (daysPast <= 0) return requestedStart;
+
+  const stepDays = job.shift_step_days || 7;
+  const firstFutureShift = Math.ceil(daysPast / stepDays);
+  return Math.max(requestedStart, firstFutureShift);
+}
+
 /* ─── Job Runner ─── */
 /* ─── Job Runner ─── */
 async function runJob(page, job) {
@@ -175,12 +196,20 @@ async function runJob(page, job) {
   }
 
   const baseOffset = computeBaseOffset(job);
+  const effectiveShiftStart = computeEffectiveShiftStart(job);
 
   log(`  Job: "${job.name}" | Shifts ${shift_start}→${shift_end} × ${shift_step_days}d${baseOffset ? ` | Base offset: ${baseOffset}d` : ''}`);
+  if (effectiveShiftStart > shift_start) {
+    log(`    Skipping past fixed-date shifts before +${effectiveShiftStart}.`);
+  }
+  if (effectiveShiftStart > shift_end) {
+    log('    No future shifts remain for this fixed-date search.');
+    return { runId: null, skippedAllPast: true };
+  }
 
   const failedShifts = []; // collect shifts that got no price
 
-  for (let i = shift_start; i <= shift_end; i++) {
+  for (let i = effectiveShiftStart; i <= shift_end; i++) {
     const days = baseOffset + (i * shift_step_days);
     const { url: shiftedUrl, shiftedDates } = shiftUrl(job.base_url, days);
 
@@ -296,7 +325,7 @@ async function runJob(page, job) {
     }
   }
 
-  return runId;
+  return { runId, skippedAllPast: false };
 }
 
 /* ─── Main Check Cycle ─── */
@@ -377,7 +406,15 @@ async function checkAndRun() {
       }
 
       try {
-        await runJob(page, job);
+        const runResult = await runJob(page, job);
+        if (runResult?.skippedAllPast) {
+          const nowIso = new Date().toISOString();
+          log(`  "${job.name}" has no future shifts left — marking inactive.`);
+          await supabase.from('tracked_searches')
+            .update({ last_run_at: nowIso, is_active: false, next_run_at: null })
+            .eq('id', job.id);
+          continue;
+        }
       } catch (err) {
         log(`  Job "${job.name}" failed: ${err.message}`);
       }
