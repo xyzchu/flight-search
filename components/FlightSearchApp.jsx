@@ -195,9 +195,21 @@ function parseFlightUrl(url) {
       }
     }
 
-    const legs = dates.map((d, i) => {
+    // Google Flights can repeat the same departure date inside one logical leg
+    // block, so we collapse consecutive identical dates before slicing segments.
+    const dateBlocks = []
+    for (const d of dates) {
+      const prev = dateBlocks[dateBlocks.length - 1]
+      if (prev?.date === d.date) {
+        prev.endIndex = d.index + 10
+      } else {
+        dateBlocks.push({ date: d.date, index: d.index, endIndex: d.index + 10 })
+      }
+    }
+
+    const legs = dateBlocks.map((d, i) => {
       const segStart = d.index + 10
-      const segEnd = i + 1 < dates.length ? dates[i + 1].index : bytes.length
+      const segEnd = i + 1 < dateBlocks.length ? dateBlocks[i + 1].index : bytes.length
       const segCodes = allCodes.filter(c => c.index >= segStart && c.index < segEnd)
       const unique = []
       for (const c of segCodes) {
@@ -206,7 +218,7 @@ function parseFlightUrl(url) {
       return {
         date: d.date,
         from: unique.length >= 2 ? unique[0] : null,
-        to: unique.length >= 2 ? unique[1] : (unique.length === 1 ? unique[0] : null),
+        to: unique.length >= 2 ? unique[unique.length - 1] : (unique.length === 1 ? unique[0] : null),
       }
     })
 
@@ -220,7 +232,7 @@ function parseFlightUrl(url) {
     }
 
     const valid = legs.filter(l => l.from && l.to)
-    return valid.length ? { dates: dates.map(d => d.date), legs: valid } : null
+    return valid.length ? { dates: dateBlocks.map(d => d.date), legs: valid } : null
   } catch { return null }
 }
 
