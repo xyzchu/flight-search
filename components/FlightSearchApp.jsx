@@ -323,6 +323,7 @@ export default function FlightSearchApp({ session }) {
   const [loadingSnap, setLoadingSnap] = useState(false)
   const [expandedShiftIds, setExpandedShiftIds] = useState(new Set())
   const [selectedResultCell, setSelectedResultCell] = useState(null)
+  const [runWindowStart, setRunWindowStart] = useState(0)
   const [shareModalId, setShareModalId] = useState(null)
   const [shareLinkCopied, setShareLinkCopied] = useState(false)
 
@@ -624,7 +625,13 @@ export default function FlightSearchApp({ session }) {
     }).sort((a, b) => new Date(b.time) - new Date(a.time))
   }, [snapshots])
 
-  const recentRuns = useMemo(() => runs.slice(0, 5), [runs])
+  const visibleRunCount = 3
+  const visibleRuns = useMemo(
+    () => runs.slice(runWindowStart, runWindowStart + visibleRunCount),
+    [runWindowStart, runs]
+  )
+  const canPageRunsLeft = runWindowStart > 0
+  const canPageRunsRight = runWindowStart + visibleRunCount < runs.length
   const activeSearch = useMemo(
     () => searches.find(s => s.id === selSearchId) || null,
     [searches, selSearchId]
@@ -648,10 +655,10 @@ export default function FlightSearchApp({ session }) {
     })
   }, [normalizeShiftedDates])
   const comparisonRows = useMemo(() => {
-    if (!recentRuns.length) return []
+    if (!visibleRuns.length) return []
     const rowMap = new Map()
     const legs = activeSearch?.parsed_legs || []
-    for (const run of recentRuns) {
+    for (const run of visibleRuns) {
       for (const item of run.items) {
         const rowKey = String(item.shift_index ?? item.shift_label ?? item.id)
         const normalizedDates = normalizeShiftedDates(item.shifted_dates, legs)
@@ -686,10 +693,10 @@ export default function FlightSearchApp({ session }) {
       if (aDate !== bDate) return aDate - bDate
       return a.shiftIndex - b.shiftIndex
     })
-  }, [activeSearch?.parsed_legs, formatLegDateLabels, normalizeShiftedDates, recentRuns])
+  }, [activeSearch?.parsed_legs, formatLegDateLabels, normalizeShiftedDates, visibleRuns])
   const selectedRun = useMemo(
-    () => recentRuns.find(r => r.runId === selectedResultCell?.runId) || null,
-    [recentRuns, selectedResultCell]
+    () => visibleRuns.find(r => r.runId === selectedResultCell?.runId) || null,
+    [visibleRuns, selectedResultCell]
   )
   const selectedItem = useMemo(
     () => selectedRun?.items.find(item => item.id === selectedResultCell?.itemId) || null,
@@ -704,6 +711,18 @@ export default function FlightSearchApp({ session }) {
     if (!selectedResultCell) return
     if (!selectedRun || !selectedItem) setSelectedResultCell(null)
   }, [selectedResultCell, selectedRun, selectedItem])
+
+  useEffect(() => {
+    setRunWindowStart(0)
+    setSelectedResultCell(null)
+  }, [selSearchId])
+
+  useEffect(() => {
+    setRunWindowStart(prev => {
+      if (runs.length <= visibleRunCount) return 0
+      return Math.min(prev, runs.length - visibleRunCount)
+    })
+  }, [runs.length])
 
   /* ── Loading ── */
   if (isLoading) return (
@@ -1374,11 +1393,34 @@ export default function FlightSearchApp({ session }) {
                     <div>
                       <p className={`${B} font-bold tracking-[0.1em] uppercase opacity-30`}>Results Matrix</p>
                       <p className="text-[10px] tracking-[0.12em] uppercase opacity-25 mt-1">
-                        Departure dates by row · last 5 runs by column
+                        Departure dates by row · 3 runs by column
                       </p>
                     </div>
                     <div className="text-right">
-                      <span className={`${B} opacity-30 tabular-nums block`}>{recentRuns.length} run{recentRuns.length !== 1 ? 's' : ''}</span>
+                      <div className="flex items-center justify-end gap-2 mb-1">
+                        <button
+                          onClick={() => setRunWindowStart(prev => Math.max(0, prev - 1))}
+                          disabled={!canPageRunsLeft}
+                          className="w-8 h-8 rounded-full bg-[#f6f6ef] text-[16px] opacity-70 hover:opacity-100 disabled:opacity-20 transition-opacity"
+                          aria-label="Show newer runs"
+                        >
+                          ←
+                        </button>
+                        <button
+                          onClick={() => setRunWindowStart(prev => Math.min(Math.max(0, runs.length - visibleRunCount), prev + 1))}
+                          disabled={!canPageRunsRight}
+                          className="w-8 h-8 rounded-full bg-[#f6f6ef] text-[16px] opacity-70 hover:opacity-100 disabled:opacity-20 transition-opacity"
+                          aria-label="Show older runs"
+                        >
+                          →
+                        </button>
+                      </div>
+                      <span className={`${B} opacity-30 tabular-nums block`}>
+                        {visibleRuns.length} run{visibleRuns.length !== 1 ? 's' : ''}
+                      </span>
+                      <span className="text-[10px] tracking-[0.12em] uppercase opacity-20">
+                        {runs.length ? `${runWindowStart + 1}-${Math.min(runWindowStart + visibleRuns.length, runs.length)} of ${runs.length}` : '0 runs'}
+                      </span>
                       {readOnly && <span className="text-[10px] tracking-[0.12em] uppercase opacity-20">Read only</span>}
                     </div>
                   </div>
@@ -1389,7 +1431,7 @@ export default function FlightSearchApp({ session }) {
                           <th className="text-left align-bottom py-2 pr-3 border-b border-[#ecece4] min-w-[220px]">
                             <span className="text-[10px] tracking-[0.12em] uppercase opacity-35 font-bold">Departure Dates</span>
                           </th>
-                          {recentRuns.map(run => (
+                          {visibleRuns.map(run => (
                             <th key={run.runId} className="align-bottom py-2 px-2 border-b border-[#ecece4] min-w-[120px]">
                               <div className="space-y-2">
                                 {canTrack && (
@@ -1421,7 +1463,7 @@ export default function FlightSearchApp({ session }) {
                                   {row.legDateLabels?.join(' · ') || row.sampleDates?.join(' · ') || row.shiftLabel}
                                 </p>
                               </td>
-                              {recentRuns.map(run => {
+                              {visibleRuns.map(run => {
                                 const item = row.cells[run.runId]
                                 const selected = selectedResultCell?.runId === run.runId && selectedResultCell?.itemId === item?.id
                                 return (
@@ -1445,7 +1487,7 @@ export default function FlightSearchApp({ session }) {
                             </tr>
                             {selectedItem && selectedRowKey === row.key && (
                               <tr>
-                                <td colSpan={recentRuns.length + 1} className="pt-0 pb-3 border-b border-[#f0f0ea]">
+                                <td colSpan={visibleRuns.length + 1} className="pt-0 pb-3 border-b border-[#f0f0ea]">
                                   <div className="pt-3">
                                     <ResultDetailCard
                                       item={selectedItem}
