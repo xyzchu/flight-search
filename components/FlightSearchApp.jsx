@@ -625,13 +625,38 @@ export default function FlightSearchApp({ session }) {
   }, [snapshots])
 
   const recentRuns = useMemo(() => runs.slice(0, 5), [runs])
+  const activeSearch = useMemo(
+    () => searches.find(s => s.id === selSearchId) || null,
+    [searches, selSearchId]
+  )
+  const normalizeShiftedDates = useCallback((dates, legs = []) => {
+    const arr = Array.isArray(dates) ? dates.filter(Boolean) : []
+    if (!arr.length) return []
+    const deduped = []
+    for (const d of arr) {
+      if (!deduped.length || deduped[deduped.length - 1] !== d) deduped.push(d)
+    }
+    if (legs?.length && deduped.length >= legs.length) return deduped.slice(0, legs.length)
+    return deduped
+  }, [])
+  const formatLegDateLabels = useCallback((dates, legs = []) => {
+    const normalized = normalizeShiftedDates(dates, legs)
+    if (!normalized.length) return []
+    return normalized.map((date, index) => {
+      const leg = legs?.[index]
+      return leg?.from && leg?.to ? `${date} ${leg.from}-${leg.to}` : date
+    })
+  }, [normalizeShiftedDates])
   const comparisonRows = useMemo(() => {
     if (!recentRuns.length) return []
     const rowMap = new Map()
+    const legs = activeSearch?.parsed_legs || []
     for (const run of recentRuns) {
       for (const item of run.items) {
         const rowKey = String(item.shift_index ?? item.shift_label ?? item.id)
-        const firstDate = item.shifted_dates?.[0] || null
+        const normalizedDates = normalizeShiftedDates(item.shifted_dates, legs)
+        const legDateLabels = formatLegDateLabels(item.shifted_dates, legs)
+        const firstDate = normalizedDates[0] || null
         const existing = rowMap.get(rowKey)
         if (!existing) {
           rowMap.set(rowKey, {
@@ -639,14 +664,18 @@ export default function FlightSearchApp({ session }) {
             shiftIndex: item.shift_index ?? 0,
             shiftLabel: item.shift_label,
             firstDate,
-            sampleDates: item.shifted_dates || [],
+            sampleDates: normalizedDates,
+            legDateLabels,
             cells: { [run.runId]: item },
           })
         } else {
           existing.cells[run.runId] = item
           if (!existing.firstDate && firstDate) existing.firstDate = firstDate
-          if ((!existing.sampleDates || existing.sampleDates.length === 0) && item.shifted_dates?.length) {
-            existing.sampleDates = item.shifted_dates
+          if ((!existing.sampleDates || existing.sampleDates.length === 0) && normalizedDates.length) {
+            existing.sampleDates = normalizedDates
+          }
+          if ((!existing.legDateLabels || existing.legDateLabels.length === 0) && legDateLabels.length) {
+            existing.legDateLabels = legDateLabels
           }
         }
       }
@@ -657,7 +686,7 @@ export default function FlightSearchApp({ session }) {
       if (aDate !== bDate) return aDate - bDate
       return a.shiftIndex - b.shiftIndex
     })
-  }, [recentRuns])
+  }, [activeSearch?.parsed_legs, formatLegDateLabels, normalizeShiftedDates, recentRuns])
   const selectedRun = useMemo(
     () => recentRuns.find(r => r.runId === selectedResultCell?.runId) || null,
     [recentRuns, selectedResultCell]
@@ -857,16 +886,19 @@ export default function FlightSearchApp({ session }) {
     return label
   }
 
-  const ResultDetailCard = ({ item, runTime, onClose }) => {
+  const ResultDetailCard = ({ item, runTime, onClose, legs }) => {
     if (!item) return null
     const flights = Array.isArray(item.flights_raw) ? item.flights_raw : []
+    const legDateLabels = formatLegDateLabels(item.shifted_dates, legs)
     return (
       <Card>
         <div className="px-5 py-4 space-y-3">
           <div className="flex items-start justify-between gap-3">
             <div className="min-w-0 flex-1">
               <p className={`${B} font-bold tabular-nums`}>{item.shift_label}</p>
-              <p className={`${B} opacity-25 mt-0.5 tabular-nums`}>{item.shifted_dates?.join(' · ')}</p>
+              <p className={`${B} opacity-25 mt-0.5 tabular-nums`}>
+                {(legDateLabels.length ? legDateLabels : normalizeShiftedDates(item.shifted_dates, legs)).join(' · ')}
+              </p>
               {runTime && (
                 <p className="text-[10px] tracking-[0.12em] uppercase opacity-35 mt-2">
                   Run · {fmtDateTime(runTime)}
@@ -1382,8 +1414,12 @@ export default function FlightSearchApp({ session }) {
                           <React.Fragment key={row.key}>
                             <tr>
                               <td className="align-top py-3 pr-3 border-b border-[#f0f0ea]">
-                                <p className={`${B} font-bold tabular-nums`}>{row.firstDate ? fmtDate(row.firstDate) : row.shiftLabel}</p>
-                                <p className="text-[11px] opacity-25 mt-1 tabular-nums">{row.sampleDates?.join(' · ') || row.shiftLabel}</p>
+                                <p className={`${B} font-bold tabular-nums`}>
+                                  {row.legDateLabels?.[0] || (row.firstDate ? fmtDate(row.firstDate) : row.shiftLabel)}
+                                </p>
+                                <p className="text-[11px] opacity-25 mt-1 tabular-nums">
+                                  {row.legDateLabels?.join(' · ') || row.sampleDates?.join(' · ') || row.shiftLabel}
+                                </p>
                               </td>
                               {recentRuns.map(run => {
                                 const item = row.cells[run.runId]
@@ -1414,6 +1450,7 @@ export default function FlightSearchApp({ session }) {
                                     <ResultDetailCard
                                       item={selectedItem}
                                       runTime={selectedRun?.time}
+                                      legs={activeSearch?.parsed_legs || []}
                                       onClose={() => setSelectedResultCell(null)}
                                     />
                                   </div>
