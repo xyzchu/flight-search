@@ -7,6 +7,7 @@ import { APP_DEPLOYED_AT } from '@/lib/build-info'
 /* ─────── CONSTANTS ─────── */
 const mono = '"SF Mono","Fira Code","Cascadia Code","Consolas","Liberation Mono",monospace'
 const B = 'text-[14px]'
+const OWNER_EMAIL = 'xyzchu@hotmail.com'
 const pad2 = (n) => String(n).padStart(2, '0')
 const parseDateOnly = (value) => {
   if (!value) return null
@@ -270,6 +271,10 @@ function searchStatus(s) {
 
 /* ─────── COMPONENT ─────── */
 export default function FlightSearchApp({ session }) {
+  const userEmail = String(session?.user?.email || '').toLowerCase()
+  const canTrack = userEmail === OWNER_EMAIL
+  const readOnly = !canTrack
+
   /* ── State ── */
   const [tab, setTab] = useState('track')
   const [searches, setSearches] = useState([])
@@ -318,16 +323,30 @@ export default function FlightSearchApp({ session }) {
 
   /* ── Load searches ── */
   const loadSearches = useCallback(async () => {
-    const { data } = await supabase
+    let query = supabase
       .from('tracked_searches')
       .select('*')
-      .eq('user_id', session.user.id)
       .order('created_at', { ascending: false })
+
+    query = canTrack
+      ? query.eq('user_id', session.user.id)
+      : query.not('share_token', 'is', null)
+
+    const { data } = await query
     if (data) setSearches(data)
     setIsLoading(false)
-  }, [session.user.id])
+  }, [canTrack, session.user.id])
 
   useEffect(() => { loadSearches() }, [loadSearches])
+
+  useEffect(() => {
+    if (readOnly && tab !== 'results') setTab('results')
+  }, [readOnly, tab])
+
+  useEffect(() => {
+    if (!readOnly || selSearchId || sharedViewData || !searches.length) return
+    setSelSearchId(searches[0].id)
+  }, [readOnly, selSearchId, sharedViewData, searches])
 
   /* ── Parse URL on change (add form) ── */
   useEffect(() => {
@@ -396,6 +415,7 @@ export default function FlightSearchApp({ session }) {
 
   /* ── Save new search ── */
   const saveSearch = async () => {
+    if (!canTrack) return notify('Read-only account')
     if (!fParsed) return notify('Paste a valid Google Flights URL')
     if (!fName.trim()) return notify('Enter a name')
     if (fStartMode === 'custom' && !fTravelStart) return notify('Choose a fixed departure date')
@@ -470,6 +490,7 @@ export default function FlightSearchApp({ session }) {
   }
 
   const saveEdit = async () => {
+    if (!canTrack) return notify('Read-only account')
     if (!eFields.name?.trim()) return notify('Enter a name')
     if (!eUrlParsed) return notify('Paste a valid Google Flights URL before saving')
     if (eFields.startMode === 'custom' && !eFields.travelStart) return notify('Choose a fixed departure date')
@@ -505,6 +526,7 @@ export default function FlightSearchApp({ session }) {
 
   /* ── Actions ── */
   const toggleActive = async (s) => {
+    if (!canTrack) return notify('Read-only account')
     const next = !s.is_active
     const upd = { is_active: next, ...(next ? { next_run_at: new Date().toISOString() } : {}) }
     await supabase.from('tracked_searches').update(upd).eq('id', s.id)
@@ -513,6 +535,7 @@ export default function FlightSearchApp({ session }) {
   }
 
   const runNow = async (s) => {
+    if (!canTrack) return notify('Read-only account')
     await supabase.from('tracked_searches')
       .update({ next_run_at: new Date().toISOString(), is_active: true })
       .eq('id', s.id)
@@ -522,6 +545,7 @@ export default function FlightSearchApp({ session }) {
   }
 
   const deleteSearch = async (id) => {
+    if (!canTrack) return notify('Read-only account')
     await supabase.from('tracked_searches').delete().eq('id', id)
     setSearches(prev => prev.filter(x => x.id !== id))
     if (selSearchId === id) { setSelSearchId(null); setSnapshots([]) }
@@ -529,6 +553,7 @@ export default function FlightSearchApp({ session }) {
   }
 
   const deleteRun = async (runId) => {
+    if (!canTrack) return notify('Read-only account')
     if (!selSearchId) return
     const { error } = await supabase
       .from('price_snapshots')
@@ -551,6 +576,7 @@ export default function FlightSearchApp({ session }) {
   }
 
   const generateShareToken = async (searchId) => {
+    if (!canTrack) return notify('Read-only account')
     const token = crypto.randomUUID()
     const { error } = await supabase.from('tracked_searches')
       .update({ share_token: token }).eq('id', searchId)
@@ -561,6 +587,7 @@ export default function FlightSearchApp({ session }) {
   }
 
   const revokeShare = async (searchId) => {
+    if (!canTrack) return notify('Read-only account')
     const { error } = await supabase.from('tracked_searches')
       .update({ share_token: null }).eq('id', searchId)
     if (!error) {
@@ -971,8 +998,15 @@ export default function FlightSearchApp({ session }) {
 
       {/* Tabs */}
       <div className="max-w-2xl mx-auto px-4 pb-4">
+        {readOnly && (
+          <div className="mb-3 px-4 py-3 rounded-2xl bg-[#f0f0ea]">
+            <p className={`${B} tracking-[0.08em] uppercase opacity-55`}>
+              Read-only access. This account can view results only.
+            </p>
+          </div>
+        )}
         <div className="flex items-center gap-2">
-          {['track', 'results'].map(t => (
+          {(canTrack ? ['track', 'results'] : ['results']).map(t => (
             <button key={t} onClick={() => setTab(t)}
               className={`${B} tracking-[0.08em] uppercase px-5 py-2.5 rounded-full transition-all ${
                 tab === t ? 'bg-[#222] text-[#f5f5ee] font-bold' : 'bg-[#f0f0ea] opacity-60 hover:opacity-100'
@@ -1264,7 +1298,9 @@ export default function FlightSearchApp({ session }) {
       {tab === 'results' && (
         <div className="max-w-2xl mx-auto px-4 py-2 space-y-4">
           <div>
-            <label className="text-[10px] tracking-[0.12em] uppercase opacity-40 font-bold block mb-1.5">Select Tracked Search</label>
+            <label className="text-[10px] tracking-[0.12em] uppercase opacity-40 font-bold block mb-1.5">
+              {readOnly ? 'Select Shared Result' : 'Select Tracked Search'}
+            </label>
             <select
               className={`w-full ${B} bg-[#f0f0ea] rounded-xl px-4 py-3 outline-none uppercase tracking-wide border-2 border-transparent focus:border-[#222] transition-colors`}
               value={selSearchId || ''} onChange={e => setSelSearchId(e.target.value || null)}>
@@ -1379,7 +1415,9 @@ export default function FlightSearchApp({ session }) {
 
           {!selSearchId && !sharedViewData && (
             <div className="py-8 text-center">
-              <p className={`${B} tracking-[0.12em] uppercase opacity-20`}>Select a tracked search or load a shared link</p>
+              <p className={`${B} tracking-[0.12em] uppercase opacity-20`}>
+                {readOnly ? 'Select a shared result or load a shared link' : 'Select a tracked search or load a shared link'}
+              </p>
             </div>
           )}
 
@@ -1405,7 +1443,10 @@ export default function FlightSearchApp({ session }) {
                         Departure dates by row · last 5 runs by column
                       </p>
                     </div>
-                    <span className={`${B} opacity-30 tabular-nums`}>{recentRuns.length} run{recentRuns.length !== 1 ? 's' : ''}</span>
+                    <div className="text-right">
+                      <span className={`${B} opacity-30 tabular-nums block`}>{recentRuns.length} run{recentRuns.length !== 1 ? 's' : ''}</span>
+                      {readOnly && <span className="text-[10px] tracking-[0.12em] uppercase opacity-20">Read only</span>}
+                    </div>
                   </div>
                   <div className="overflow-x-auto">
                     <table className="w-full border-separate border-spacing-0">
@@ -1417,12 +1458,14 @@ export default function FlightSearchApp({ session }) {
                           {recentRuns.map(run => (
                             <th key={run.runId} className="align-bottom py-2 px-2 border-b border-[#ecece4] min-w-[120px]">
                               <div className="space-y-2">
-                                <button
-                                  onClick={() => ask(`Delete run from ${fmtDateTime(run.time)}?`, () => deleteRun(run.runId))}
-                                  className="text-[10px] tracking-[0.12em] uppercase opacity-20 hover:opacity-80 transition-opacity"
-                                >
-                                  Delete
-                                </button>
+                                {canTrack && (
+                                  <button
+                                    onClick={() => ask(`Delete run from ${fmtDateTime(run.time)}?`, () => deleteRun(run.runId))}
+                                    className="text-[10px] tracking-[0.12em] uppercase opacity-20 hover:opacity-80 transition-opacity"
+                                  >
+                                    Delete
+                                  </button>
+                                )}
                                 <div>
                                   <p className="text-[11px] tracking-[0.08em] uppercase opacity-35 font-bold">{fmtDateTime(run.time)}</p>
                                   <p className="text-[10px] opacity-25 mt-1">{run.items.length} shifts</p>
