@@ -632,6 +632,7 @@ export default function FlightSearchApp({ session }) {
   )
   const canPageRunsLeft = runWindowStart > 0
   const canPageRunsRight = runWindowStart + visibleRunCount < runs.length
+  const todayDateOnly = formatDateOnly(new Date())
   const activeSearch = useMemo(
     () => searches.find(s => s.id === selSearchId) || null,
     [searches, selSearchId]
@@ -687,13 +688,16 @@ export default function FlightSearchApp({ session }) {
         }
       }
     }
-    return [...rowMap.values()].sort((a, b) => {
+    return [...rowMap.values()].filter(row => {
+      if (!row.firstDate) return true
+      return row.firstDate >= todayDateOnly
+    }).sort((a, b) => {
       const aDate = a.firstDate ? new Date(a.firstDate).getTime() : Number.MAX_SAFE_INTEGER
       const bDate = b.firstDate ? new Date(b.firstDate).getTime() : Number.MAX_SAFE_INTEGER
       if (aDate !== bDate) return aDate - bDate
       return a.shiftIndex - b.shiftIndex
     })
-  }, [activeSearch?.parsed_legs, formatLegDateLabels, normalizeShiftedDates, visibleRuns])
+  }, [activeSearch?.parsed_legs, formatLegDateLabels, normalizeShiftedDates, todayDateOnly, visibleRuns])
   const selectedRun = useMemo(
     () => visibleRuns.find(r => r.runId === selectedResultCell?.runId) || null,
     [visibleRuns, selectedResultCell]
@@ -711,6 +715,11 @@ export default function FlightSearchApp({ session }) {
     if (!selectedResultCell) return
     if (!selectedRun || !selectedItem) setSelectedResultCell(null)
   }, [selectedResultCell, selectedRun, selectedItem])
+
+  useEffect(() => {
+    if (!selectedRowKey) return
+    if (!comparisonRows.some(row => row.key === selectedRowKey)) setSelectedResultCell(null)
+  }, [comparisonRows, selectedRowKey])
 
   useEffect(() => {
     setRunWindowStart(0)
