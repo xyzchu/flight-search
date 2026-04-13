@@ -3,16 +3,11 @@
 import React, { useState, useEffect, useMemo, useCallback } from 'react'
 import { supabase } from '@/lib/supabase'
 import { APP_DEPLOYED_AT } from '@/lib/build-info'
-import {
-  LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip as RTooltip,
-  ResponsiveContainer, Legend,
-} from 'recharts'
 
 /* ─────── CONSTANTS ─────── */
 const mono = '"SF Mono","Fira Code","Cascadia Code","Consolas","Liberation Mono",monospace'
 const B = 'text-[14px]'
 const pad2 = (n) => String(n).padStart(2, '0')
-const COLORS = ['#1a1a1a','#e63946','#457b9d','#2a9d8f','#e9c46a','#f4a261','#264653','#6a4c93','#d62828','#588157']
 
 /* ─────── AIRPORTS ─────── */
 const AIRPORTS = [
@@ -287,8 +282,8 @@ export default function FlightSearchApp({ session }) {
   const [selSearchId, setSelSearchId] = useState(null)
   const [snapshots, setSnapshots] = useState([])
   const [loadingSnap, setLoadingSnap] = useState(false)
-  const [expandedRun, setExpandedRun] = useState(null)
   const [expandedShiftIds, setExpandedShiftIds] = useState(new Set())
+  const [selectedResultCell, setSelectedResultCell] = useState(null)
   const [shareModalId, setShareModalId] = useState(null)
   const [shareLinkCopied, setShareLinkCopied] = useState(false)
   const [sharedTokenInput, setSharedTokenInput] = useState('')
@@ -513,6 +508,19 @@ export default function FlightSearchApp({ session }) {
     notify('Deleted')
   }
 
+  const deleteRun = async (runId) => {
+    if (!selSearchId) return
+    const { error } = await supabase
+      .from('price_snapshots')
+      .delete()
+      .eq('tracked_search_id', selSearchId)
+      .eq('run_id', runId)
+    if (error) return notify('Error: ' + error.message)
+    setSnapshots(prev => prev.filter(s => s.run_id !== runId))
+    setSelectedResultCell(prev => prev?.runId === runId ? null : prev)
+    notify('Run deleted')
+  }
+
   /* ── Share functions ── */
   const toggleShiftExpand = (id) => {
     setExpandedShiftIds(prev => {
@@ -581,25 +589,53 @@ export default function FlightSearchApp({ session }) {
     }).sort((a, b) => new Date(b.time) - new Date(a.time))
   }, [snapshots])
 
-  const trendData = useMemo(() =>
-    runs.slice().reverse().filter(r => r.cheapest).map(r => ({ date: fmtDateTime(r.time), best: r.cheapest }))
-  , [runs])
-
-  const shiftIndices = useMemo(() => {
-    const s = new Set()
-    for (const r of runs) for (const i of r.items) s.add(i.shift_index)
-    return [...s].sort((a, b) => a - b)
-  }, [runs])
-
-  const shiftTrendData = useMemo(() =>
-    runs.slice().reverse().map(r => {
-      const pt = { date: fmtDateTime(r.time) }
-      for (const i of r.items) pt[`s${i.shift_index}`] = i.cheapest_price
-      return pt
+  const recentRuns = useMemo(() => runs.slice(0, 5), [runs])
+  const comparisonRows = useMemo(() => {
+    if (!recentRuns.length) return []
+    const rowMap = new Map()
+    for (const run of recentRuns) {
+      for (const item of run.items) {
+        const rowKey = String(item.shift_index ?? item.shift_label ?? item.id)
+        const firstDate = item.shifted_dates?.[0] || null
+        const existing = rowMap.get(rowKey)
+        if (!existing) {
+          rowMap.set(rowKey, {
+            key: rowKey,
+            shiftIndex: item.shift_index ?? 0,
+            shiftLabel: item.shift_label,
+            firstDate,
+            sampleDates: item.shifted_dates || [],
+            cells: { [run.runId]: item },
+          })
+        } else {
+          existing.cells[run.runId] = item
+          if (!existing.firstDate && firstDate) existing.firstDate = firstDate
+          if ((!existing.sampleDates || existing.sampleDates.length === 0) && item.shifted_dates?.length) {
+            existing.sampleDates = item.shifted_dates
+          }
+        }
+      }
+    }
+    return [...rowMap.values()].sort((a, b) => {
+      const aDate = a.firstDate ? new Date(a.firstDate).getTime() : Number.MAX_SAFE_INTEGER
+      const bDate = b.firstDate ? new Date(b.firstDate).getTime() : Number.MAX_SAFE_INTEGER
+      if (aDate !== bDate) return aDate - bDate
+      return a.shiftIndex - b.shiftIndex
     })
-  , [runs])
+  }, [recentRuns])
+  const selectedRun = useMemo(
+    () => recentRuns.find(r => r.runId === selectedResultCell?.runId) || null,
+    [recentRuns, selectedResultCell]
+  )
+  const selectedItem = useMemo(
+    () => selectedRun?.items.find(item => item.id === selectedResultCell?.itemId) || null,
+    [selectedRun, selectedResultCell]
+  )
 
-  const selSearch = useMemo(() => searches.find(s => s.id === selSearchId), [searches, selSearchId])
+  useEffect(() => {
+    if (!selectedResultCell) return
+    if (!selectedRun || !selectedItem) setSelectedResultCell(null)
+  }, [selectedResultCell, selectedRun, selectedItem])
 
   /* ── URL share param on mount ── */
   useEffect(() => {
@@ -770,6 +806,66 @@ export default function FlightSearchApp({ session }) {
     if (s.stop_date) label += ` · Stops ${s.stop_date}`
     else label += ' · No end date'
     return label
+  }
+
+  const ResultDetailCard = ({ item, runTime, onClose }) => {
+    if (!item) return null
+    const flights = Array.isArray(item.flights_raw) ? item.flights_raw : []
+    return (
+      <Card>
+        <div className="px-5 py-4 space-y-3">
+          <div className="flex items-start justify-between gap-3">
+            <div className="min-w-0 flex-1">
+              <p className={`${B} font-bold tabular-nums`}>{item.shift_label}</p>
+              <p className={`${B} opacity-25 mt-0.5 tabular-nums`}>{item.shifted_dates?.join(' · ')}</p>
+              {runTime && (
+                <p className="text-[10px] tracking-[0.12em] uppercase opacity-35 mt-2">
+                  Run · {fmtDateTime(runTime)}
+                </p>
+              )}
+            </div>
+            <div className="flex items-center gap-3">
+              <span className={`${B} font-bold tabular-nums`}>
+                {item.cheapest_price ? `A$${item.cheapest_price.toLocaleString()}` : '—'}
+              </span>
+              <button onClick={onClose} className={`${B} opacity-25 hover:opacity-100`}>✕</button>
+            </div>
+          </div>
+
+          <div className="bg-[#f8f8f4] rounded-xl overflow-hidden">
+            <div className="px-4 py-2.5 border-b border-[#ebebeb] flex items-center justify-between gap-2">
+              <span className={`${B} opacity-40 tabular-nums`}>
+                {item.result_count} result{item.result_count !== 1 ? 's' : ''}
+              </span>
+              {item.url_used && (
+                <a href={item.url_used} target="_blank" rel="noopener noreferrer"
+                  className="text-[11px] tracking-[0.06em] uppercase opacity-40 hover:opacity-80 underline underline-offset-2 transition-opacity">
+                  Open on Google Flights ↗
+                </a>
+              )}
+            </div>
+            <div className="px-4 pb-3 pt-1 space-y-1">
+              {flights.length === 0 && (
+                <p className={`${B} opacity-25 py-2`}>No scraped flight details</p>
+              )}
+              {flights.map((raw, fi) => {
+                const f = parseFlightSnippet(raw)
+                return (
+                  <div key={fi} className="flex flex-wrap items-baseline gap-x-3 gap-y-0 py-1 border-b border-[#eee] last:border-0">
+                    {f?.airline && <span className={`${B} font-bold opacity-80`}>{f.airline}</span>}
+                    {f?.depTime && <span className={`${B} tabular-nums opacity-60`}>{f.depTime} – {f.arrTime}</span>}
+                    {f?.duration && <span className="text-[12px] opacity-40">{f.duration}</span>}
+                    {f?.stops && <span className={`text-[12px] ${f.stops === 'Nonstop' ? 'text-emerald-600 opacity-80' : 'opacity-50'}`}>{f.stops}</span>}
+                    {f?.price && <span className={`${B} font-bold ml-auto tabular-nums`}>A${f.price.toLocaleString()}</span>}
+                    {!f?.airline && !f?.depTime && <span className="text-[11px] opacity-30 font-mono">{String(raw).slice(0, 120)}</span>}
+                  </div>
+                )
+              })}
+            </div>
+          </div>
+        </div>
+      </Card>
+    )
   }
 
   return (
@@ -1282,193 +1378,83 @@ export default function FlightSearchApp({ session }) {
             <>
               <Card>
                 <div className="px-5 py-4">
-                  <div className="flex items-center justify-between mb-3">
-                    <span className={`${B} font-bold tracking-[0.1em] uppercase opacity-30`}>Latest Run</span>
-                    <span className={`${B} opacity-30 tabular-nums`}>{fmtDateTime(runs[0].time)}</span>
-                  </div>
-                  <div className="space-y-1.5">
-                    {runs[0].items.map(item => {
-                      const isBest = item.cheapest_price === runs[0].cheapest && item.cheapest_price
-                      const isExp = expandedShiftIds.has(item.id)
-                      const flights = Array.isArray(item.flights_raw) ? item.flights_raw : []
-                      return (
-                        <div key={item.id} className={`rounded-xl overflow-hidden ${isBest ? 'bg-emerald-50' : 'bg-[#f8f8f4]'}`}>
-                          <div className="flex items-center justify-between py-2 px-3">
-                            <div className="min-w-0 flex-1">
-                              <span className={`${B} font-bold tabular-nums`}>{item.shift_label}</span>
-                              <span className={`${B} opacity-40 ml-2 tabular-nums`}>
-                                {item.shifted_dates?.map(d => fmtDate(d)).join(' · ')}
-                              </span>
-                            </div>
-                            <div className="flex items-center gap-2">
-                              <span className={`text-[18px] font-bold tabular-nums ${isBest ? 'text-emerald-700' : ''}`}>
-                                {item.cheapest_price ? `A$${item.cheapest_price.toLocaleString()}` : '—'}
-                              </span>
-                              {flights.length > 0 && (
-                                <button onClick={() => toggleShiftExpand(item.id)}
-                                  className={`text-[11px] tracking-[0.06em] uppercase px-2 py-1 rounded-lg transition-all ${isExp ? 'bg-[#ddd] opacity-80' : 'opacity-30 hover:opacity-70'}`}>
-                                  {isExp ? '▲' : `▼ ${flights.length}`}
-                                </button>
-                              )}
-                            </div>
-                          </div>
-                          {isExp && (
-                            <div className={`px-3 pb-3 pt-1 border-t ${isBest ? 'border-emerald-100' : 'border-[#ebebeb]'} space-y-1`}>
-                              {flights.map((raw, fi) => {
-                                const f = parseFlightSnippet(raw)
-                                return (
-                                  <div key={fi} className="flex flex-wrap items-baseline gap-x-3 gap-y-0 py-1 border-b border-[#eee] last:border-0">
-                                    {f?.airline && <span className={`${B} font-bold opacity-80`}>{f.airline}</span>}
-                                    {f?.depTime && <span className={`${B} tabular-nums opacity-60`}>{f.depTime} – {f.arrTime}</span>}
-                                    {f?.duration && <span className="text-[12px] opacity-40">{f.duration}</span>}
-                                    {f?.stops && <span className={`text-[12px] ${f.stops === 'Nonstop' ? 'text-emerald-600 opacity-80' : 'opacity-50'}`}>{f.stops}</span>}
-                                    {f?.price && <span className={`${B} font-bold ml-auto tabular-nums`}>A${f.price.toLocaleString()}</span>}
-                                    {!f?.airline && !f?.depTime && <span className="text-[11px] opacity-30 font-mono">{raw.slice(0, 80)}</span>}
-                                  </div>
-                                )
-                              })}
-                              {item.url_used && (
-                                <a href={item.url_used} target="_blank" rel="noopener noreferrer"
-                                  className="inline-block mt-1 text-[11px] tracking-[0.06em] uppercase opacity-40 hover:opacity-80 underline underline-offset-2 transition-opacity">
-                                  Open on Google Flights ↗
-                                </a>
-                              )}
-                            </div>
-                          )}
-                        </div>
-                      )
-                    })}
-                  </div>
-                  {runs[0].cheapest && (
-                    <div className="mt-3 pt-3 border-t border-[#f0f0ea] flex items-center justify-between">
-                      <span className={`${B} tracking-[0.1em] uppercase opacity-40`}>Best Price</span>
-                      <span className="text-[28px] font-bold tabular-nums text-emerald-700">A${runs[0].cheapest.toLocaleString()}</span>
+                  <div className="flex items-center justify-between gap-3 mb-4">
+                    <div>
+                      <p className={`${B} font-bold tracking-[0.1em] uppercase opacity-30`}>Results Matrix</p>
+                      <p className="text-[10px] tracking-[0.12em] uppercase opacity-25 mt-1">
+                        Departure dates by row · last 5 runs by column
+                      </p>
                     </div>
-                  )}
+                    <span className={`${B} opacity-30 tabular-nums`}>{recentRuns.length} run{recentRuns.length !== 1 ? 's' : ''}</span>
+                  </div>
+                  <div className="overflow-x-auto">
+                    <table className="w-full border-separate border-spacing-0">
+                      <thead>
+                        <tr>
+                          <th className="text-left align-bottom py-2 pr-3 border-b border-[#ecece4] min-w-[220px]">
+                            <span className="text-[10px] tracking-[0.12em] uppercase opacity-35 font-bold">Departure Dates</span>
+                          </th>
+                          {recentRuns.map(run => (
+                            <th key={run.runId} className="align-bottom py-2 px-2 border-b border-[#ecece4] min-w-[120px]">
+                              <div className="space-y-2">
+                                <button
+                                  onClick={() => ask(`Delete run from ${fmtDateTime(run.time)}?`, () => deleteRun(run.runId))}
+                                  className="text-[10px] tracking-[0.12em] uppercase opacity-20 hover:opacity-80 transition-opacity"
+                                >
+                                  Delete
+                                </button>
+                                <div>
+                                  <p className="text-[11px] tracking-[0.08em] uppercase opacity-35 font-bold">{fmtDateTime(run.time)}</p>
+                                  <p className="text-[10px] opacity-25 mt-1">{run.items.length} shifts</p>
+                                </div>
+                              </div>
+                            </th>
+                          ))}
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {comparisonRows.map(row => (
+                          <tr key={row.key}>
+                            <td className="align-top py-3 pr-3 border-b border-[#f0f0ea]">
+                              <p className={`${B} font-bold tabular-nums`}>{row.firstDate ? fmtDate(row.firstDate) : row.shiftLabel}</p>
+                              <p className="text-[11px] opacity-25 mt-1 tabular-nums">{row.sampleDates?.join(' · ') || row.shiftLabel}</p>
+                            </td>
+                            {recentRuns.map(run => {
+                              const item = row.cells[run.runId]
+                              const selected = selectedResultCell?.runId === run.runId && selectedResultCell?.itemId === item?.id
+                              return (
+                                <td key={run.runId} className="align-top px-2 py-3 border-b border-[#f0f0ea]">
+                                  {item ? (
+                                    <button
+                                      onClick={() => setSelectedResultCell({ runId: run.runId, itemId: item.id })}
+                                      className={`w-full text-left rounded-xl px-3 py-3 transition-all ${selected ? 'bg-[#222] text-[#f5f5ee]' : 'bg-[#f8f8f4] hover:bg-[#efefe8]'}`}
+                                    >
+                                      <span className={`block ${B} font-bold tabular-nums`}>{item.cheapest_price ? `A$${item.cheapest_price.toLocaleString()}` : '—'}</span>
+                                      <span className={`block text-[10px] tracking-[0.08em] uppercase mt-1 ${selected ? 'opacity-70' : 'opacity-30'}`}>
+                                        {item.result_count} result{item.result_count !== 1 ? 's' : ''}
+                                      </span>
+                                    </button>
+                                  ) : (
+                                    <div className="w-full rounded-xl px-3 py-3 bg-[#fbfbf8] text-[12px] opacity-20 text-center">—</div>
+                                  )}
+                                </td>
+                              )
+                            })}
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
                 </div>
               </Card>
 
-              {shiftTrendData.length >= 2 && (
-                <Card>
-                  <div className="px-5 py-4">
-                    <p className={`${B} tracking-[0.12em] uppercase font-bold opacity-40 mb-4`}>Price Trends by Shift</p>
-                    <ResponsiveContainer width="100%" height={260}>
-                      <LineChart data={shiftTrendData}>
-                        <CartesianGrid strokeDasharray="3 3" stroke="#e8e8e0" />
-                        <XAxis dataKey="date" tick={{ fontSize: 10, fontFamily: mono, fill: '#999' }} stroke="#ddd" tickLine={false} />
-                        <YAxis tick={{ fontSize: 10, fontFamily: mono, fill: '#999' }} stroke="#ddd" tickLine={false} tickFormatter={v => `$${v}`} />
-                        <RTooltip contentStyle={{ fontFamily: mono, fontSize: 12, borderRadius: 12, border: 'none', boxShadow: '0 4px 16px rgba(0,0,0,0.12)', background: '#fff' }}
-                          formatter={(v, name) => [`A$${v?.toLocaleString() || '—'}`, name]} />
-                        <Legend wrapperStyle={{ fontFamily: mono, fontSize: 11 }} />
-                        {shiftIndices.map((si, idx) => (
-                          <Line key={si} type="monotone" dataKey={`s${si}`}
-                            name={`+${si * (selSearch?.shift_step_days || 7)}d`}
-                            stroke={COLORS[idx % COLORS.length]} strokeWidth={2}
-                            dot={{ r: 3 }} activeDot={{ r: 5 }} connectNulls />
-                        ))}
-                      </LineChart>
-                    </ResponsiveContainer>
-                  </div>
-                </Card>
+              {selectedItem && (
+                <ResultDetailCard
+                  item={selectedItem}
+                  runTime={selectedRun?.time}
+                  onClose={() => setSelectedResultCell(null)}
+                />
               )}
-
-              {trendData.length >= 2 && (
-                <Card>
-                  <div className="px-5 py-4">
-                    <p className={`${B} tracking-[0.12em] uppercase font-bold opacity-40 mb-4`}>Best Price Over Time</p>
-                    <ResponsiveContainer width="100%" height={180}>
-                      <LineChart data={trendData}>
-                        <CartesianGrid strokeDasharray="3 3" stroke="#e8e8e0" />
-                        <XAxis dataKey="date" tick={{ fontSize: 10, fontFamily: mono, fill: '#999' }} stroke="#ddd" tickLine={false} />
-                        <YAxis tick={{ fontSize: 10, fontFamily: mono, fill: '#999' }} stroke="#ddd" tickLine={false} tickFormatter={v => `$${v}`} />
-                        <RTooltip contentStyle={{ fontFamily: mono, fontSize: 12, borderRadius: 12, border: 'none', boxShadow: '0 4px 16px rgba(0,0,0,0.12)', background: '#fff' }}
-                          formatter={v => [`A$${v?.toLocaleString()}`, 'Best Price']} />
-                        <Line type="monotone" dataKey="best" stroke="#2a9d8f" strokeWidth={2.5}
-                          dot={{ fill: '#2a9d8f', r: 4 }} activeDot={{ r: 6 }} />
-                      </LineChart>
-                    </ResponsiveContainer>
-                  </div>
-                </Card>
-              )}
-
-              <div>
-                <p className={`${B} tracking-[0.12em] uppercase font-bold opacity-40 mb-3`}>All Runs ({runs.length})</p>
-                <div className="space-y-2">
-                  {runs.map(r => {
-                    const isExp = expandedRun === r.runId
-                    return (
-                      <Card key={r.runId}>
-                        <button className="w-full text-left px-5 py-3 hover:bg-[#fafaf6] transition-colors"
-                          onClick={() => setExpandedRun(isExp ? null : r.runId)}>
-                          <div className="flex items-center justify-between">
-                            <div>
-                              <span className={`${B} tabular-nums`}>{fmtDateTime(r.time)}</span>
-                              <span className={`${B} opacity-25 ml-2`}>{r.items.length} shifts</span>
-                            </div>
-                            <div className="flex items-center gap-2">
-                              <span className={`${B} font-bold tabular-nums`}>{r.cheapest ? `A$${r.cheapest.toLocaleString()}` : '—'}</span>
-                              <span className={`${B} opacity-20`}>{isExp ? '▲' : '▼'}</span>
-                            </div>
-                          </div>
-                        </button>
-                        {isExp && (
-                          <div className="px-5 pb-4 space-y-1.5 border-t border-[#f0f0ea] pt-3">
-                            {r.items.map(item => {
-                              const isShiftExp = expandedShiftIds.has(item.id)
-                              const flights = Array.isArray(item.flights_raw) ? item.flights_raw : []
-                              return (
-                                <div key={item.id} className="bg-[#f8f8f4] rounded-xl overflow-hidden">
-                                  <div className="px-4 py-2.5">
-                                    <div className="flex items-center justify-between flex-wrap gap-1">
-                                      <div>
-                                        <span className={`${B} font-bold tabular-nums`}>{item.shift_label}</span>
-                                        <span className={`${B} opacity-30 ml-2`}>{item.result_count} result{item.result_count !== 1 ? 's' : ''}</span>
-                                      </div>
-                                      <div className="flex items-center gap-2">
-                                        <span className={`${B} font-bold tabular-nums`}>{item.cheapest_price ? `A$${item.cheapest_price.toLocaleString()}` : '—'}</span>
-                                        {flights.length > 0 && (
-                                          <button onClick={() => toggleShiftExpand(item.id)}
-                                            className={`text-[11px] tracking-[0.06em] uppercase px-2 py-1 rounded-lg transition-all ${isShiftExp ? 'bg-[#ddd] opacity-80' : 'opacity-30 hover:opacity-70'}`}>
-                                            {isShiftExp ? '▲' : `▼ ${flights.length}`}
-                                          </button>
-                                        )}
-                                      </div>
-                                    </div>
-                                    <p className={`${B} opacity-25 mt-0.5 tabular-nums`}>{item.shifted_dates?.join(' · ')}</p>
-                                  </div>
-                                  {isShiftExp && (
-                                    <div className="px-4 pb-3 pt-1 border-t border-[#ebebeb] space-y-1">
-                                      {flights.map((raw, fi) => {
-                                        const f = parseFlightSnippet(raw)
-                                        return (
-                                          <div key={fi} className="flex flex-wrap items-baseline gap-x-3 gap-y-0 py-1 border-b border-[#eee] last:border-0">
-                                            {f?.airline && <span className={`${B} font-bold opacity-80`}>{f.airline}</span>}
-                                            {f?.depTime && <span className={`${B} tabular-nums opacity-60`}>{f.depTime} – {f.arrTime}</span>}
-                                            {f?.duration && <span className="text-[12px] opacity-40">{f.duration}</span>}
-                                            {f?.stops && <span className={`text-[12px] ${f.stops === 'Nonstop' ? 'text-emerald-600 opacity-80' : 'opacity-50'}`}>{f.stops}</span>}
-                                            {f?.price && <span className={`${B} font-bold ml-auto tabular-nums`}>A${f.price.toLocaleString()}</span>}
-                                            {!f?.airline && !f?.depTime && <span className="text-[11px] opacity-30 font-mono">{raw.slice(0, 80)}</span>}
-                                          </div>
-                                        )
-                                      })}
-                                      {item.url_used && (
-                                        <a href={item.url_used} target="_blank" rel="noopener noreferrer"
-                                          className="inline-block mt-1 text-[11px] tracking-[0.06em] uppercase opacity-40 hover:opacity-80 underline underline-offset-2 transition-opacity">
-                                          Open on Google Flights ↗
-                                        </a>
-                                      )}
-                                    </div>
-                                  )}
-                                </div>
-                              )
-                            })}
-                          </div>
-                        )}
-                      </Card>
-                    )
-                  })}
-                </div>
-              </div>
             </>
           )}
         </div>
