@@ -26,6 +26,17 @@ const shiftDateOnly = (value, days) => {
   d.setDate(d.getDate() + days)
   return formatDateOnly(d)
 }
+const formatDateTimeLocalInput = (value) => {
+  const d = value ? new Date(value) : new Date()
+  if (Number.isNaN(d.getTime())) return ''
+  const local = new Date(d.getTime() - d.getTimezoneOffset() * 60000)
+  return local.toISOString().slice(0, 16)
+}
+const localInputToIso = (value) => {
+  if (!value) return null
+  const d = new Date(value)
+  return Number.isNaN(d.getTime()) ? null : d.toISOString()
+}
 
 /* ─────── AIRPORTS ─────── */
 const AIRPORTS = [
@@ -298,6 +309,7 @@ export default function FlightSearchApp({ session }) {
   const [fRelativeDays, setFRelativeDays] = useState(14)
   const [fTravelStart, setFTravelStart] = useState('')       // custom date
   const [fHasEndDate, setFHasEndDate] = useState(true)
+  const [fStartAt, setFStartAt] = useState(formatDateTimeLocalInput())
 
   // Edit
   const [editingId, setEditingId] = useState(null)
@@ -439,7 +451,7 @@ export default function FlightSearchApp({ session }) {
         schedule_interval_days: fOneOff ? 0 : normalizePositiveInt(fSchedDays),
         stop_date: fOneOff ? null : (fHasEndDate ? fStopDate || null : null),
         is_active: true,
-        next_run_at: new Date().toISOString(),
+        next_run_at: localInputToIso(fStartAt) || new Date().toISOString(),
       })
       .select().single()
     setSaving(false)
@@ -456,6 +468,7 @@ export default function FlightSearchApp({ session }) {
     setFUrl(''); setFName(''); setFParsed(null); setShowAdd(false)
     setFOneOff(false); setFStartMode('url'); setFRelativeDays(14)
     setFTravelStart(''); setFHasEndDate(true); setFStopDate('')
+    setFStartAt(formatDateTimeLocalInput())
   }
 
   /* ── Edit handlers ── */
@@ -473,6 +486,7 @@ export default function FlightSearchApp({ session }) {
       shift_step_days: s.shift_step_days ?? 7,
       schedule_interval_days: s.schedule_interval_days ?? 1,
       stop_date: s.stop_date || '',
+      startAt: formatDateTimeLocalInput(s.next_run_at),
       oneoff: (s.schedule_interval_days || 0) === 0,
       startMode: mode,
       relativeDays: s.travel_date_relative_days ?? 14,
@@ -512,6 +526,7 @@ export default function FlightSearchApp({ session }) {
       shift_step_days: eFields.shift_step_days,
       schedule_interval_days: eFields.oneoff ? 0 : normalizePositiveInt(eFields.schedule_interval_days),
       stop_date: eFields.oneoff ? null : (eFields.hasEndDate ? eFields.stop_date || null : null),
+      next_run_at: localInputToIso(eFields.startAt) || new Date().toISOString(),
     }
     const { error } = await supabase.from('tracked_searches').update(upd).eq('id', editingId)
     setESaving(false)
@@ -830,6 +845,23 @@ export default function FlightSearchApp({ session }) {
     </div>
   )
 
+  const StartDateTimePicker = ({ value, onChange, oneOff = false }) => (
+    <div>
+      <label className="text-[10px] tracking-[0.12em] uppercase opacity-40 font-bold block mb-1.5">
+        {oneOff ? 'Scrape At' : 'First Scrape At'}
+      </label>
+      <input
+        type="datetime-local"
+        value={value}
+        onChange={e => onChange(e.target.value)}
+        className={`w-full ${B} bg-[#f0f0ea] rounded-xl px-4 py-3 outline-none tracking-wide border-2 border-transparent focus:border-[#222] transition-colors`}
+      />
+      <p className="text-[10px] tracking-[0.08em] uppercase opacity-25 mt-1.5">
+        Uses your local date and time
+      </p>
+    </div>
+  )
+
   /* ── Display helpers ── */
   const routeLabel = (legs) => {
     if (!legs?.length) return ''
@@ -1110,6 +1142,8 @@ export default function FlightSearchApp({ session }) {
                       <Toggle label="One-off (run once, don't repeat)" checked={fOneOff} onChange={setFOneOff} />
                     </div>
 
+                    <StartDateTimePicker value={fStartAt} onChange={setFStartAt} oneOff={fOneOff} />
+
                       {!fOneOff && (
                         <div className="space-y-3">
                         <Input label="Re-check every (days)" type="number" value={fSchedDays} onChange={v => setFSchedDays(normalizePositiveInt(v))} />
@@ -1260,6 +1294,8 @@ export default function FlightSearchApp({ session }) {
                       </div>
 
                       <Toggle label="One-off (run once, don't repeat)" checked={eFields.oneoff} onChange={v => updateE('oneoff', v)} />
+
+                      <StartDateTimePicker value={eFields.startAt || ''} onChange={v => updateE('startAt', v)} oneOff={eFields.oneoff} />
 
                       {!eFields.oneoff && (
                         <div className="space-y-3">
