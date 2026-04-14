@@ -340,10 +340,15 @@ export default function FlightSearchApp({ session }) {
 
     query = canTrack
       ? query.eq('user_id', session.user.id)
-      : query.not('share_token', 'is', null)
+      : query
 
-    const { data } = await query
-    if (data) setSearches(data)
+    const { data, error } = await query
+    if (error) {
+      notify('Could not load results: ' + error.message)
+      setSearches([])
+    } else if (data) {
+      setSearches(data)
+    }
     setIsLoading(false)
   }, [canTrack, session.user.id])
 
@@ -411,13 +416,18 @@ export default function FlightSearchApp({ session }) {
     if (!selSearchId) { setSnapshots([]); return }
     const load = async () => {
       setLoadingSnap(true)
-      const { data } = await supabase
+      const { data, error } = await supabase
         .from('price_snapshots')
         .select('*')
         .eq('tracked_search_id', selSearchId)
         .order('scraped_at', { ascending: false })
         .limit(500)
-      if (data) setSnapshots(data)
+      if (error) {
+        notify('Could not load snapshots: ' + error.message)
+        setSnapshots([])
+      } else if (data) {
+        setSnapshots(data)
+      }
       setLoadingSnap(false)
     }
     load()
@@ -1365,7 +1375,7 @@ export default function FlightSearchApp({ session }) {
         <div className="max-w-2xl mx-auto px-4 py-2 space-y-4">
           <div>
             <label className="text-[10px] tracking-[0.12em] uppercase opacity-40 font-bold block mb-1.5">
-              {readOnly ? 'Select Shared Result' : 'Select Tracked Search'}
+              {readOnly ? 'Select Result Set' : 'Select Tracked Search'}
             </label>
             <select
               className={`w-full ${B} bg-[#f0f0ea] rounded-xl px-4 py-3 outline-none uppercase tracking-wide border-2 border-transparent focus:border-[#222] transition-colors`}
