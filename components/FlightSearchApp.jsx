@@ -1378,10 +1378,15 @@ export default function FlightSearchApp({ session }) {
               {readOnly ? 'Select Result Set' : 'Select Tracked Search'}
             </label>
             <select
-              className={`w-full ${B} bg-[#f0f0ea] rounded-xl px-4 py-3 outline-none uppercase tracking-wide border-2 border-transparent focus:border-[#222] transition-colors`}
+              className={`w-full ${B} bg-[#f0f0ea] text-[#1a1a1a] rounded-xl px-4 py-3 outline-none uppercase tracking-wide border-2 border-transparent focus:border-[#222] transition-colors`}
+              style={{ colorScheme: 'light' }}
               value={selSearchId || ''} onChange={e => setSelSearchId(e.target.value || null)}>
-              <option value="">— Choose —</option>
-              {searches.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
+              <option value="" style={{ backgroundColor: '#f0f0ea', color: '#1a1a1a' }}>— Choose —</option>
+              {searches.map(s => (
+                <option key={s.id} value={s.id} style={{ backgroundColor: '#f0f0ea', color: '#1a1a1a' }}>
+                  {s.name}
+                </option>
+              ))}
             </select>
           </div>
 
