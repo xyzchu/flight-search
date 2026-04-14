@@ -12,6 +12,9 @@ export default function AuthForm() {
   const [loading, setLoading] = useState(false)
   const [message, setMessage] = useState('')
   const [error, setError] = useState('')
+  const emailRedirectTo = typeof window === 'undefined'
+    ? undefined
+    : `${window.location.origin}/`
 
   const handleSubmit = async (e) => {
     e.preventDefault()
@@ -20,7 +23,11 @@ export default function AuthForm() {
     setMessage('')
 
     if (isSignUp) {
-      const { error } = await supabase.auth.signUp({ email, password })
+      const { error } = await supabase.auth.signUp({
+        email,
+        password,
+        options: { emailRedirectTo },
+      })
       if (error) setError(error.message)
       else setMessage('Check your email for the confirmation link')
     } else {
