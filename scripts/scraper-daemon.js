@@ -6,11 +6,13 @@ const path = require('path');
 /* ─── Config ─── */
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const CHECK_MINS = parseInt(process.env.CHECK_INTERVAL_MINUTES || '30', 10);
 const RUN_ONCE = process.argv.includes('--once');
+const MAX_TIMER_MS = 2147483647;
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
-let cycleInProgress = false;
+const jobTimers = new Map();
+let runQueue = Promise.resolve();
+let realtimeChannel = null;
 
 function delay(ms) { return new Promise(r => setTimeout(r, ms)); }
 const log = (msg) => console.log(`[${new Date().toISOString()}] ${msg}`);
@@ -328,48 +330,158 @@ async function runJob(page, job) {
   return { runId, skippedAllPast: false };
 }
 
-/* ─── Main Check Cycle ─── */
-async function checkAndRun() {
-  if (cycleInProgress) {
-    log('Previous cycle still running; skipping this tick.');
+/* ─── Realtime Scheduling ─── */
+function clearJobTimer(jobId) {
+  const existing = jobTimers.get(jobId);
+  if (existing) {
+    clearTimeout(existing);
+    jobTimers.delete(jobId);
+  }
+}
+
+function queueJobRun(jobId) {
+  runQueue = runQueue
+    .then(() => runScheduledJob(jobId))
+    .catch(err => log(`Queued job error (${jobId}): ${err.message}`));
+  return runQueue;
+}
+
+function scheduleJob(job) {
+  if (!job?.id) return;
+  clearJobTimer(job.id);
+
+  if (!job.is_active) {
+    log(`Unscheduling "${job.name}" (inactive).`);
     return;
   }
-  cycleInProgress = true;
-  log('Checking for due jobs...');
+
+  const targetTime = job.next_run_at ? new Date(job.next_run_at).getTime() : Date.now();
+  if (!Number.isFinite(targetTime)) {
+    log(`Cannot schedule "${job.name}" — invalid next_run_at.`);
+    return;
+  }
+
+  const delayMs = Math.max(0, targetTime - Date.now());
+  const timeoutMs = Math.min(delayMs, MAX_TIMER_MS);
+
+  if (delayMs > MAX_TIMER_MS) {
+    log(`Scheduled "${job.name}" in long timer chunk (${Math.round(delayMs / 86400000)}d away).`);
+    const timer = setTimeout(() => scheduleJob(job), timeoutMs);
+    jobTimers.set(job.id, timer);
+    return;
+  }
+
+  log(`Scheduled "${job.name}" for ${job.next_run_at || 'now'}${delayMs ? ` (${Math.round(delayMs / 1000)}s)` : ' (due now)'}.`);
+  const timer = setTimeout(() => {
+    jobTimers.delete(job.id);
+    queueJobRun(job.id);
+  }, timeoutMs);
+  jobTimers.set(job.id, timer);
+}
+
+async function fetchJob(jobId) {
+  const { data, error } = await supabase
+    .from('tracked_searches')
+    .select('*')
+    .eq('id', jobId)
+    .maybeSingle();
+
+  if (error) throw error;
+  return data;
+}
+
+async function refreshSchedule(jobId) {
+  const job = await fetchJob(jobId);
+  if (!job) {
+    clearJobTimer(jobId);
+    return;
+  }
+  scheduleJob(job);
+}
+
+async function loadAndScheduleActiveJobs() {
+  const { data: jobs, error } = await supabase
+    .from('tracked_searches')
+    .select('*')
+    .eq('is_active', true)
+    .order('next_run_at', { ascending: true });
+
+  if (error) throw error;
+
+  for (const job of jobs || []) {
+    scheduleJob(job);
+  }
+
+  log(`Loaded ${jobs?.length || 0} active job(s) into local schedule.`);
+}
+
+async function runScheduledJob(jobId) {
+  const job = await fetchJob(jobId);
+  if (!job) {
+    log(`Job ${jobId} no longer exists.`);
+    clearJobTimer(jobId);
+    return;
+  }
+
+  if (!job.is_active) {
+    log(`Skipping "${job.name}" — job inactive.`);
+    clearJobTimer(job.id);
+    return;
+  }
+
+  if (job.next_run_at && new Date(job.next_run_at).getTime() > Date.now() + 1000) {
+    scheduleJob(job);
+    return;
+  }
+
+  log(`Running scheduled job "${job.name}"...`);
+
+  if (job.stop_date && hasStopDatePassed(job.stop_date)) {
+    log(`  "${job.name}" past stop date — deactivating.`);
+    await supabase.from('tracked_searches')
+      .update({ is_active: false })
+      .eq('id', job.id);
+    clearJobTimer(job.id);
+    return;
+  }
+
+  const claimTimestamp = new Date().toISOString();
+  const nextPlaceholder = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+  const { data: claimedJobs, error: claimError } = await supabase
+    .from('tracked_searches')
+    .update({ last_run_at: claimTimestamp, next_run_at: nextPlaceholder })
+    .eq('id', job.id)
+    .eq('is_active', true)
+    .eq('next_run_at', job.next_run_at)
+    .select('id');
+
+  if (claimError) {
+    log(`  Could not claim "${job.name}": ${claimError.message}`);
+    await refreshSchedule(job.id);
+    return;
+  }
+  if (!claimedJobs?.length) {
+    log(`  Skipping "${job.name}" — another worker already claimed it.`);
+    await refreshSchedule(job.id);
+    return;
+  }
+
+  const profileDir = path.join(__dirname, '.browser-profile');
+  let context;
 
   try {
-    const now = new Date().toISOString();
-    const { data: jobs, error } = await supabase
-      .from('tracked_searches')
-      .select('*')
-      .eq('is_active', true)
-      .lte('next_run_at', now)
-      .order('next_run_at', { ascending: true });
-
-    if (error) { log(`DB error: ${error.message}`); return; }
-    if (!jobs?.length) { log('No jobs due.'); return; }
-
-    log(`Found ${jobs.length} job(s) to run.`);
-
-    const profileDir = path.join(__dirname, '.browser-profile');
-    let context;
-    try {
-      context = await chromium.launchPersistentContext(profileDir, {
-        headless: false,
-        args: [
-          '--disable-blink-features=AutomationControlled',
-          '--no-sandbox',
-          '--disable-dev-shm-usage',
-        ],
-        ignoreDefaultArgs: ['--enable-automation'],
-        viewport: { width: 1366, height: 900 },
-        locale: 'en-AU',
-        userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-      });
-    } catch (err) {
-      log(`Browser launch failed: ${err.message}`);
-      return;
-    }
+    context = await chromium.launchPersistentContext(profileDir, {
+      headless: false,
+      args: [
+        '--disable-blink-features=AutomationControlled',
+        '--no-sandbox',
+        '--disable-dev-shm-usage',
+      ],
+      ignoreDefaultArgs: ['--enable-automation'],
+      viewport: { width: 1366, height: 900 },
+      locale: 'en-AU',
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+    });
 
     const page = context.pages()[0] || await context.newPage();
     page.setDefaultTimeout(60000);
@@ -377,72 +489,87 @@ async function checkAndRun() {
       Object.defineProperty(navigator, 'webdriver', { get: () => false });
     });
 
-    for (const job of jobs) {
-      if (job.stop_date && hasStopDatePassed(job.stop_date)) {
-        log(`  "${job.name}" past stop date — deactivating.`);
-        await supabase.from('tracked_searches')
-          .update({ is_active: false })
-          .eq('id', job.id);
-        continue;
-      }
+    const runResult = await runJob(page, job);
+    const nowIso = new Date().toISOString();
 
-      const claimTimestamp = new Date().toISOString();
-      const nextPlaceholder = new Date(Date.now() + 60 * 60 * 1000).toISOString();
-      const { data: claimedJobs, error: claimError } = await supabase
-        .from('tracked_searches')
-        .update({ last_run_at: claimTimestamp, next_run_at: nextPlaceholder })
-        .eq('id', job.id)
-        .eq('is_active', true)
-        .eq('next_run_at', job.next_run_at)
-        .select('id');
-
-      if (claimError) {
-        log(`  Could not claim "${job.name}": ${claimError.message}`);
-        continue;
-      }
-      if (!claimedJobs?.length) {
-        log(`  Skipping "${job.name}" — another cycle already claimed it.`);
-        continue;
-      }
-
-      try {
-        const runResult = await runJob(page, job);
-        if (runResult?.skippedAllPast) {
-          const nowIso = new Date().toISOString();
-          log(`  "${job.name}" has no future shifts left — marking inactive.`);
-          await supabase.from('tracked_searches')
-            .update({ last_run_at: nowIso, is_active: false, next_run_at: null })
-            .eq('id', job.id);
-          continue;
-        }
-      } catch (err) {
-        log(`  Job "${job.name}" failed: ${err.message}`);
-      }
-
-      const nowIso = new Date().toISOString();
-
-      if ((job.schedule_interval_days || 0) === 0) {
-        log(`  "${job.name}" is one-off — marking complete.`);
-        await supabase.from('tracked_searches')
-          .update({ last_run_at: nowIso, is_active: false })
-          .eq('id', job.id);
-      } else {
-        const next = new Date();
-        next.setDate(next.getDate() + (job.schedule_interval_days || 1));
-        await supabase.from('tracked_searches')
-          .update({ last_run_at: nowIso, next_run_at: next.toISOString() })
-          .eq('id', job.id);
-        log(`  Next run for "${job.name}": ${next.toISOString()}`);
-      }
-
-      await delay(5000);
+    if (runResult?.skippedAllPast) {
+      log(`  "${job.name}" has no future shifts left — marking inactive.`);
+      await supabase.from('tracked_searches')
+        .update({ last_run_at: nowIso, is_active: false, next_run_at: null })
+        .eq('id', job.id);
+    } else if ((job.schedule_interval_days || 0) === 0) {
+      log(`  "${job.name}" is one-off — marking complete.`);
+      await supabase.from('tracked_searches')
+        .update({ last_run_at: nowIso, is_active: false, next_run_at: null })
+        .eq('id', job.id);
+    } else {
+      const next = new Date();
+      next.setDate(next.getDate() + (job.schedule_interval_days || 1));
+      await supabase.from('tracked_searches')
+        .update({ last_run_at: nowIso, next_run_at: next.toISOString() })
+        .eq('id', job.id);
+      log(`  Next run for "${job.name}": ${next.toISOString()}`);
     }
 
-    await context.close();
-    log('All jobs done. Browser closed.');
+    await delay(5000);
+  } catch (err) {
+    log(`  Job "${job.name}" failed: ${err.message}`);
   } finally {
-    cycleInProgress = false;
+    if (context) await context.close().catch(() => {});
+    await refreshSchedule(job.id).catch(err => log(`Schedule refresh failed for "${job.name}": ${err.message}`));
   }
+}
+
+async function runDueJobsOnce() {
+  const now = new Date().toISOString();
+  const { data: jobs, error } = await supabase
+    .from('tracked_searches')
+    .select('*')
+    .eq('is_active', true)
+    .lte('next_run_at', now)
+    .order('next_run_at', { ascending: true });
+
+  if (error) throw error;
+  if (!jobs?.length) {
+    log('No jobs due.');
+    return;
+  }
+
+  log(`Found ${jobs.length} due job(s).`);
+  for (const job of jobs) {
+    await runScheduledJob(job.id);
+  }
+}
+
+async function startRealtimeDaemon() {
+  if (typeof supabase.realtime?.setAuth === 'function') {
+    await supabase.realtime.setAuth(SUPABASE_KEY);
+  }
+
+  await loadAndScheduleActiveJobs();
+
+  realtimeChannel = supabase
+    .channel('tracked-searches-daemon')
+    .on(
+      'postgres_changes',
+      { event: '*', schema: 'public', table: 'tracked_searches' },
+      (payload) => {
+        const row = payload.eventType === 'DELETE' ? payload.old : payload.new;
+        if (!row?.id) return;
+
+        if (payload.eventType === 'DELETE' || !row.is_active) {
+          clearJobTimer(row.id);
+          log(`Realtime ${payload.eventType.toLowerCase()}: unscheduled job ${row.id}.`);
+          return;
+        }
+
+        log(`Realtime ${payload.eventType.toLowerCase()}: rescheduling "${row.name}".`);
+        scheduleJob(row);
+      }
+    )
+    .subscribe((status) => {
+      log(`Realtime status: ${status}`);
+    });
 }
 
 /* ─── Start ─── */
@@ -450,20 +577,19 @@ console.log('═'.repeat(50));
 console.log('  FLIGHT PRICE TRACKER DAEMON');
 console.log('═'.repeat(50));
 console.log(`  Mode: ${RUN_ONCE ? 'Run once' : 'Daemon (continuous)'}`);
-console.log(`  Check interval: ${CHECK_MINS} minutes`);
+console.log(`  Trigger mode: ${RUN_ONCE ? 'Immediate due jobs only' : 'Realtime + local timers'}`);
 console.log(`  Supabase: ${SUPABASE_URL}`);
 console.log('');
 
-checkAndRun()
+const startPromise = RUN_ONCE ? runDueJobsOnce() : startRealtimeDaemon();
+
+startPromise
   .then(() => {
     if (RUN_ONCE) {
       console.log('\n--once mode: exiting.');
       process.exit(0);
     }
-    log(`Daemon running. Checking every ${CHECK_MINS}m. Ctrl+C to stop.\n`);
-    setInterval(() => {
-      checkAndRun().catch(err => log(`Cycle error: ${err.message}`));
-    }, CHECK_MINS * 60 * 1000);
+    log('Daemon running. Listening for Realtime changes and scheduled local timers. Ctrl+C to stop.\n');
   })
   .catch(err => {
     log(`Fatal: ${err.message}`);
