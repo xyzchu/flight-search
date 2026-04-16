@@ -124,6 +124,21 @@ const normalizePositiveInt = (value, fallback = 1) => {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback
 }
 
+async function enqueueRemoteJob(supabaseClient, userId, jobType, payload = {}) {
+  const { data, error } = await supabaseClient
+    .from('remote_job_requests')
+    .insert([{
+      user_id: userId,
+      job_type: jobType,
+      payload,
+    }])
+    .select('*')
+    .single()
+
+  if (error) throw error
+  return data
+}
+
 /* ─────── FLIGHT SNIPPET PARSER ─────── */
 // Format: "12:05 AM12:05 AM on Wed, Apr 29 – 6:50 AM6:50 AM on Wed, Apr 29Cathay Pacific8 hr 45 min...Nonstop...A$1,108..."
 // or with stop: "7:10 PM...– 6:55 AM+1...Thu, Apr 30Qantas, Cathay Pacific13 hr 45 min...1 stop...A$1,191..."
@@ -559,12 +574,35 @@ export default function FlightSearchApp({ session }) {
 
   const runNow = async (s) => {
     if (!canTrack) return notify('Read-only account')
-    await supabase.from('tracked_searches')
-      .update({ next_run_at: new Date().toISOString(), is_active: true })
-      .eq('id', s.id)
-    setSearches(prev => prev.map(x => x.id === s.id
-      ? { ...x, next_run_at: new Date().toISOString(), is_active: true } : x))
-    notify('Queued — daemon will pick it up')
+    const fallbackNow = new Date().toISOString()
+    const queuedState = { next_run_at: fallbackNow, is_active: true }
+
+    try {
+      const { error: queuePrepError } = await supabase.from('tracked_searches')
+        .update(queuedState)
+        .eq('id', s.id)
+
+      if (queuePrepError) {
+        notify('Error: ' + queuePrepError.message)
+        return
+      }
+
+      setSearches(prev => prev.map(x => x.id === s.id ? { ...x, ...queuedState } : x))
+      await enqueueRemoteJob(supabase, session.user.id, 'run_search', { search_id: s.id })
+      notify('Run request sent — daemon should pick it up within a minute')
+    } catch (remoteError) {
+      const { error } = await supabase.from('tracked_searches')
+        .update(queuedState)
+        .eq('id', s.id)
+
+      if (error) {
+        notify('Error: ' + error.message)
+        return
+      }
+
+      setSearches(prev => prev.map(x => x.id === s.id ? { ...x, ...queuedState } : x))
+      notify('Run request queue unavailable — fell back to schedule polling')
+    }
   }
 
   const deleteSearch = async (id) => {
