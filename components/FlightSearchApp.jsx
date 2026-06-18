@@ -574,23 +574,14 @@ export default function FlightSearchApp({ session }) {
 
   const runNow = async (s) => {
     if (!canTrack) return notify('Read-only account')
-    const fallbackNow = new Date().toISOString()
-    const queuedState = { next_run_at: fallbackNow, is_active: true }
+    const queuedAt = new Date().toISOString()
 
     try {
-      const { error: queuePrepError } = await supabase.from('tracked_searches')
-        .update(queuedState)
-        .eq('id', s.id)
-
-      if (queuePrepError) {
-        notify('Error: ' + queuePrepError.message)
-        return
-      }
-
-      setSearches(prev => prev.map(x => x.id === s.id ? { ...x, ...queuedState } : x))
       await enqueueRemoteJob(supabase, session.user.id, 'run_search', { search_id: s.id })
+      setSearches(prev => prev.map(x => x.id === s.id ? { ...x, is_active: true } : x))
       notify('Run request sent — daemon should pick it up within a minute')
     } catch (remoteError) {
+      const queuedState = { next_run_at: queuedAt, is_active: true }
       const { error } = await supabase.from('tracked_searches')
         .update(queuedState)
         .eq('id', s.id)

@@ -6,6 +6,7 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
+    "scrape:once": "node scripts/scraper-daemon.js --once",
     "lint": "eslint"
   },
   "dependencies": {
