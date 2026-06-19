@@ -660,8 +660,8 @@ console.log(`  Supabase: ${SUPABASE_URL}`);
 console.log('');
 
 checkAndRun()
-  .then(async () => {
-    await processPendingRemoteRequests().catch(err => log(`Remote cycle error: ${err.message}`));
+  .then(() => {
+    processPendingRemoteRequests().catch(err => log(`Remote cycle error: ${err.message}`));
     if (RUN_ONCE) {
       console.log('\n--once mode: exiting.');
       process.exit(0);
