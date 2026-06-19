@@ -42,4 +42,4 @@ next-env.d.ts
 
 scripts/.browser-profile/
 scripts/node_modules/
-.env
+start-daemon.bat
