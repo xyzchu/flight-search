@@ -16,7 +16,18 @@ let remoteCycleInProgress = false;
 const activeSearchRuns = new Set();
 
 function delay(ms) { return new Promise(r => setTimeout(r, ms)); }
-const log = (msg) => console.log(`[${new Date().toISOString()}] ${msg}`);
+const brisbaneDateTime = new Intl.DateTimeFormat('en-AU', {
+  timeZone: 'Australia/Brisbane',
+  year: 'numeric',
+  month: '2-digit',
+  day: '2-digit',
+  hour: '2-digit',
+  minute: '2-digit',
+  second: '2-digit',
+  hour12: false,
+});
+const formatBrisbaneTime = (value = new Date()) => `${brisbaneDateTime.format(new Date(value))} AEST`;
+const log = (msg) => console.log(`[${formatBrisbaneTime()}] ${msg}`);
 
 /* ─── URL / TFS Helpers ─── */
 function b64urlDecode(str) {
@@ -426,7 +437,7 @@ async function finalizeTrackedSearchAfterRun(job) {
   await supabase.from('tracked_searches')
     .update({ last_run_at: nowIso, next_run_at: next.toISOString() })
     .eq('id', job.id);
-  log(`  Next run for "${job.name}": ${next.toISOString()}`);
+  log(`  Next run for "${job.name}": ${formatBrisbaneTime(next)}`);
 }
 
 async function executeTrackedSearch(page, job) {
@@ -656,6 +667,7 @@ console.log('═'.repeat(50));
 console.log(`  Mode: ${RUN_ONCE ? 'Run once' : 'Daemon (continuous)'}`);
 console.log(`  Check interval: ${CHECK_MINS} minutes`);
 console.log(`  Remote request check: ${REMOTE_CHECK_SECS} seconds`);
+console.log('  Log timezone: Australia/Brisbane');
 console.log(`  Supabase: ${SUPABASE_URL}`);
 console.log('');
 
