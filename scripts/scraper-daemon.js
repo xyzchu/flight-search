@@ -537,6 +537,22 @@ async function processPendingRemoteRequests() {
           throw new Error('Tracked search not found');
         }
 
+        // Run now makes the search due AND enqueues a remote job. The serialized
+        // wake runs the schedule cycle first, so by the time this request is
+        // processed the search has usually already run — skip the duplicate.
+        if (job.last_run_at && new Date(job.last_run_at).getTime() > new Date(row.requested_at).getTime()) {
+          log(`  "${job.name}" already ran at ${formatBrisbaneTime(job.last_run_at)} — skipping duplicate remote run.`);
+          await completeRemoteRequest(row.id, {
+            ok: true,
+            tracked_search_id: job.id,
+            name: job.name,
+            skipped: true,
+            reason: 'Search already ran via scheduled wake',
+            run_id: null,
+          });
+          continue;
+        }
+
         if (!page) {
           context = await chromium.launchPersistentContext(profileDir, {
             headless: false,
