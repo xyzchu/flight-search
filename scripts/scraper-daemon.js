@@ -2,6 +2,7 @@ require('dotenv').config({ path: __dirname + '/.env' });
 const { chromium } = require('playwright');
 const { createClient } = require('@supabase/supabase-js');
 const path = require('path');
+const net = require('net');
 
 /* ─── Config ─── */
 const SUPABASE_URL = process.env.SUPABASE_URL;
@@ -660,31 +661,155 @@ async function checkAndRun() {
   }
 }
 
+/* ─── Singleton lock ─── */
+const LOCK_PORT = 4731;
+let lockServer = null;
+
+function acquireLock() {
+  return new Promise((resolve, reject) => {
+    const srv = net.createServer();
+    srv.once('error', (err) => {
+      if (err.code === 'EADDRINUSE') {
+        log('Another scraper daemon is already running (lock port in use); exiting.');
+        process.exit(0);
+      }
+      reject(err);
+    });
+    srv.listen(LOCK_PORT, '127.0.0.1', () => {
+      lockServer = srv;
+      resolve();
+    });
+  });
+}
+
+/* ─── Event-driven loop ─── */
+const SAFETY_TICK_MS = 30 * 60 * 1000; // belt-and-braces if a realtime event is missed
+const MAX_TIMER_MS = 2 ** 31 - 1;
+let dueTimer = null;
+let realtimeChannel = null;
+let waking = false;
+let rescheduleBusy = false;
+let rescheduleQueued = false;
+
+async function computeNextDueWaitMs() {
+  try {
+    const { data, error } = await supabase
+      .from('tracked_searches')
+      .select('next_run_at')
+      .eq('is_active', true)
+      .not('next_run_at', 'is', null)
+      .order('next_run_at', { ascending: true })
+      .limit(1);
+
+    if (error) {
+      log(`Next-due query failed: ${error.message}`);
+      return null;
+    }
+    if (data?.length && data[0]?.next_run_at) {
+      return Math.max(0, new Date(data[0].next_run_at).getTime() - Date.now());
+    }
+  } catch (err) {
+    log(`Next-due query error: ${err.message}`);
+  }
+  return null;
+}
+
+async function scheduleNextDueWake() {
+  if (RUN_ONCE) return;
+  if (rescheduleBusy) {
+    rescheduleQueued = true;
+    return;
+  }
+  rescheduleBusy = true;
+  try {
+    do {
+      rescheduleQueued = false;
+      if (dueTimer) {
+        clearTimeout(dueTimer);
+        dueTimer = null;
+      }
+      const waitMs = await computeNextDueWaitMs();
+      let delay;
+      if (waitMs === null) {
+        delay = SAFETY_TICK_MS;
+      } else if (waitMs > 0) {
+        delay = Math.min(waitMs + 500, MAX_TIMER_MS);
+        log(`Next scheduled run in ${Math.round(waitMs / 60000)}m — sleeping until then.`);
+      } else {
+        delay = 5000;
+        log('A search is due now — waking shortly.');
+      }
+      dueTimer = setTimeout(() => { void wake('schedule'); }, delay);
+    } while (rescheduleQueued);
+  } finally {
+    rescheduleBusy = false;
+  }
+}
+
+async function wake(reason) {
+  if (RUN_ONCE || waking) return;
+  waking = true;
+  try {
+    log(`Wake: ${reason}`);
+    await checkAndRun().catch(err => log(`Cycle error: ${err.message}`));
+    await processPendingRemoteRequests().catch(err => log(`Remote cycle error: ${err.message}`));
+  } finally {
+    waking = false;
+    await scheduleNextDueWake();
+  }
+}
+
+function subscribeRealtime() {
+  if (RUN_ONCE) return;
+  realtimeChannel = supabase
+    .channel('daemon-wake')
+    .on('postgres_changes',
+      { event: 'INSERT', schema: 'public', table: 'remote_job_requests' },
+      (payload) => {
+        log(`Realtime: remote job queued (${payload.new?.id}) — processing now.`);
+        processPendingRemoteRequests()
+          .catch(err => log(`Remote cycle error: ${err.message}`))
+          .finally(() => scheduleNextDueWake());
+      })
+    .on('postgres_changes',
+      { event: '*', schema: 'public', table: 'tracked_searches' },
+      () => {
+        log('Realtime: tracked searches changed — rescheduling wake.');
+        scheduleNextDueWake();
+      })
+    .subscribe((status) => {
+      if (status === 'SUBSCRIBED') log('Realtime channel connected.');
+      else if (status === 'CHANNEL_ERROR') log('Realtime channel error — safety tick will cover missed events.');
+      else if (status === 'TIMED_OUT' || status === 'CLOSED') log(`Realtime channel ${status} — safety tick will cover missed events.`);
+    });
+}
+
 /* ─── Start ─── */
 console.log('═'.repeat(50));
 console.log('  FLIGHT PRICE TRACKER DAEMON');
 console.log('═'.repeat(50));
-console.log(`  Mode: ${RUN_ONCE ? 'Run once' : 'Daemon (continuous)'}`);
-console.log(`  Check interval: ${CHECK_MINS} minutes`);
-console.log(`  Remote request check: ${REMOTE_CHECK_SECS} seconds`);
+console.log(`  Mode: ${RUN_ONCE ? 'Run once' : 'Daemon (continuous, event-driven)'}`);
+console.log(`  Remote safety poll: ${REMOTE_CHECK_SECS} seconds`);
 console.log('  Log timezone: Australia/Brisbane');
 console.log(`  Supabase: ${SUPABASE_URL}`);
 console.log('');
 
-checkAndRun()
-  .then(() => {
-    processPendingRemoteRequests().catch(err => log(`Remote cycle error: ${err.message}`));
+acquireLock()
+  .then(async () => {
+    await checkAndRun().catch(err => log(`Cycle error: ${err.message}`));
+    await processPendingRemoteRequests().catch(err => log(`Remote cycle error: ${err.message}`));
+
     if (RUN_ONCE) {
       console.log('\n--once mode: exiting.');
       process.exit(0);
     }
-    log(`Daemon running. Checking schedules every ${CHECK_MINS}m and remote requests every ${REMOTE_CHECK_SECS}s. Ctrl+C to stop.\n`);
-    setInterval(() => {
-      checkAndRun().catch(err => log(`Cycle error: ${err.message}`));
-    }, CHECK_MINS * 60 * 1000);
+
+    log('Event-driven daemon: wakes instantly on realtime events, sleeps until the next due search, and runs a safety tick every 30m. Ctrl+C to stop.\n');
+    subscribeRealtime();
     setInterval(() => {
       processPendingRemoteRequests().catch(err => log(`Remote cycle error: ${err.message}`));
     }, REMOTE_CHECK_SECS * 1000);
+    await scheduleNextDueWake();
   })
   .catch(err => {
     log(`Fatal: ${err.message}`);
