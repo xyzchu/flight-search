@@ -7,6 +7,11 @@ import AuthForm from '@/components/AuthForm'
 export default function Home() {
   const [session, setSession] = useState(null)
   const [loading, setLoading] = useState(true)
+  // Safe to read at render: the first render always shows Loading, so
+  // hydration output matches regardless of the token.
+  const shareToken = typeof window === 'undefined'
+    ? null
+    : new URLSearchParams(window.location.search).get('share')
 
   useEffect(() => {
     supabase.auth.getSession().then(({ data: { session } }) => {
@@ -32,6 +37,9 @@ export default function Home() {
     </div>
   )
 
-  if (!session) return <AuthForm />
+  if (!session) {
+    if (shareToken) return <FlightSearchApp session={null} shareToken={shareToken} />
+    return <AuthForm />
+  }
   return <FlightSearchApp session={session} />
 }

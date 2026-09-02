@@ -3,6 +3,7 @@
 import React, { useState, useEffect, useMemo, useCallback } from 'react'
 import { supabase } from '@/lib/supabase'
 import { APP_DEPLOYED_AT } from '@/lib/build-info'
+import AuthForm from './AuthForm'
 
 /* ─────── CONSTANTS ─────── */
 const mono = '"SF Mono","Fira Code","Cascadia Code","Consolas","Liberation Mono",monospace'
@@ -296,10 +297,12 @@ function searchStatus(s) {
 }
 
 /* ─────── COMPONENT ─────── */
-export default function FlightSearchApp({ session }) {
+export default function FlightSearchApp({ session, shareToken = null }) {
   const userEmail = String(session?.user?.email || '').toLowerCase()
   const canTrack = userEmail === OWNER_EMAIL
   const readOnly = !canTrack
+  const isShare = !session && !!shareToken
+  const [showAuth, setShowAuth] = useState(false)
 
   /* ── State ── */
   const [tab, setTab] = useState('track')
@@ -353,9 +356,11 @@ export default function FlightSearchApp({ session }) {
       .select('*')
       .order('created_at', { ascending: false })
 
-    query = canTrack
-      ? query.eq('user_id', session.user.id)
-      : query
+    if (shareToken && !canTrack) {
+      query = query.eq('share_token', shareToken)
+    } else if (canTrack) {
+      query = query.eq('user_id', session.user.id)
+    }
 
     const { data, error } = await query
     if (error) {
@@ -365,9 +370,13 @@ export default function FlightSearchApp({ session }) {
       setSearches(data)
     }
     setIsLoading(false)
-  }, [canTrack, session.user.id])
+  }, [canTrack, session?.user?.id, shareToken])
 
   useEffect(() => { loadSearches() }, [loadSearches])
+
+  useEffect(() => {
+    if (session) setShowAuth(false)
+  }, [session])
 
   useEffect(() => {
     if (readOnly && tab !== 'results') setTab('results')
@@ -1098,6 +1107,19 @@ export default function FlightSearchApp({ session }) {
         )
       })()}
 
+      {/* Sign-in overlay for shared view */}
+      {!session && showAuth && (
+        <div className="fixed inset-0 z-50 overflow-auto" style={{ background: '#FAFAF5' }}>
+          <button
+            onClick={() => setShowAuth(false)}
+            className={`fixed top-4 right-4 z-[60] ${B} tracking-[0.1em] uppercase px-4 py-2.5 rounded-xl bg-[#f0f0ea] opacity-60 hover:opacity-100`}
+          >
+            ✕ Close
+          </button>
+          <AuthForm />
+        </div>
+      )}
+
       {/* Header */}
       <header>
         <div className="max-w-2xl mx-auto px-4 py-5 flex items-end justify-between gap-4">
@@ -1111,7 +1133,7 @@ export default function FlightSearchApp({ session }) {
         {readOnly && (
           <div className="mb-3 px-4 py-3 rounded-2xl bg-[#f0f0ea]">
             <p className={`${B} tracking-[0.08em] uppercase opacity-55`}>
-              Read-only access. This account can view results only.
+              {isShare ? 'Shared results — read-only view.' : 'Read-only access. This account can view results only.'}
             </p>
           </div>
         )}
@@ -1125,10 +1147,17 @@ export default function FlightSearchApp({ session }) {
             </button>
           ))}
           <div className="flex-1" />
-          <button onClick={() => supabase.auth.signOut()}
-            className={`${B} tracking-[0.1em] uppercase px-4 py-2.5 rounded-xl bg-[#f0f0ea] opacity-40 hover:opacity-100 transition-opacity`}>
-            Sign Out
-          </button>
+          {session ? (
+            <button onClick={() => supabase.auth.signOut()}
+              className={`${B} tracking-[0.1em] uppercase px-4 py-2.5 rounded-xl bg-[#f0f0ea] opacity-40 hover:opacity-100 transition-opacity`}>
+              Sign Out
+            </button>
+          ) : (
+            <button onClick={() => setShowAuth(true)}
+              className={`${B} tracking-[0.1em] uppercase px-4 py-2.5 rounded-xl bg-[#f0f0ea] opacity-40 hover:opacity-100 transition-opacity`}>
+              Sign In
+            </button>
+          )}
         </div>
       </div>
 
