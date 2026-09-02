@@ -1082,7 +1082,7 @@ export default function FlightSearchApp({ session, shareToken = null }) {
               {!link ? (
                 <div className="space-y-3">
                   <p className={`${B} opacity-40 text-[12px] leading-relaxed`}>
-                    Generate a link so others can view these results (read-only). They must be logged in to view.
+                    Generate a link so others can view these results (read-only). No login needed.
                   </p>
                   <Btn onClick={() => generateShareToken(s.id)} variant="primary" className="w-full">Generate Share Link</Btn>
                 </div>
