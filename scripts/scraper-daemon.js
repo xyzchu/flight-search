@@ -275,6 +275,10 @@ async function runJob(page, job) {
         failedShifts.push({ shiftIndex: i, days, shiftedUrl, shiftedDates });
       }
     } catch (err) {
+      if (/browser has been closed|context has been closed|Target page/i.test(err.message || '')) {
+        log('      Browser closed mid-run — aborting this job.');
+        throw err;
+      }
       log(`      ERROR: ${err.message}`);
       await supabase.from('price_snapshots').insert({
         tracked_search_id: job.id,
@@ -341,6 +345,10 @@ async function runJob(page, job) {
           log(`      ❌ Retry still no price — keeping null`);
         }
       } catch (err) {
+        if (/browser has been closed|context has been closed|Target page/i.test(err.message || '')) {
+          log('      Browser closed mid-run — aborting this job.');
+          throw err;
+        }
         log(`      ❌ Retry error: ${err.message}`);
       }
 
@@ -736,8 +744,8 @@ async function scheduleNextDueWake() {
         delay = Math.min(waitMs + 500, MAX_TIMER_MS);
         log(`Next scheduled run in ${Math.round(waitMs / 60000)}m — sleeping until then.`);
       } else {
-        delay = 5000;
-        log('A search is due now — waking shortly.');
+        delay = 60_000;
+        log('A search is due now — waking within a minute.');
       }
       dueTimer = setTimeout(() => { void wake('schedule'); }, delay);
     } while (rescheduleQueued);
@@ -767,9 +775,7 @@ function subscribeRealtime() {
       { event: 'INSERT', schema: 'public', table: 'remote_job_requests' },
       (payload) => {
         log(`Realtime: remote job queued (${payload.new?.id}) — processing now.`);
-        processPendingRemoteRequests()
-          .catch(err => log(`Remote cycle error: ${err.message}`))
-          .finally(() => scheduleNextDueWake());
+        wake('realtime');
       })
     .on('postgres_changes',
       { event: '*', schema: 'public', table: 'tracked_searches' },
@@ -784,6 +790,28 @@ function subscribeRealtime() {
     });
 }
 
+async function failStaleRunningRequests() {
+  const cutoff = new Date(Date.now() - 30 * 60 * 1000).toISOString();
+  const { data, error } = await supabase
+    .from('remote_job_requests')
+    .update({
+      status: 'failed',
+      error: 'Daemon restarted; stale running job expired',
+      completed_at: new Date().toISOString(),
+    })
+    .eq('status', 'running')
+    .lt('last_heartbeat_at', cutoff)
+    .select('id');
+
+  if (error) {
+    log(`Stale-job cleanup failed: ${error.message}`);
+    return;
+  }
+  if (data?.length) {
+    log(`Marked ${data.length} stale running request(s) as failed.`);
+  }
+}
+
 /* ─── Start ─── */
 console.log('═'.repeat(50));
 console.log('  FLIGHT PRICE TRACKER DAEMON');
@@ -796,6 +824,7 @@ console.log('');
 
 acquireLock()
   .then(async () => {
+    await failStaleRunningRequests().catch(err => log(`Stale-job cleanup error: ${err.message}`));
     await checkAndRun().catch(err => log(`Cycle error: ${err.message}`));
     await processPendingRemoteRequests().catch(err => log(`Remote cycle error: ${err.message}`));
 
@@ -807,7 +836,7 @@ acquireLock()
     log('Event-driven daemon: wakes instantly on realtime events, sleeps until the next due search, and runs a safety tick every 30m. Ctrl+C to stop.\n');
     subscribeRealtime();
     setInterval(() => {
-      processPendingRemoteRequests().catch(err => log(`Remote cycle error: ${err.message}`));
+      wake('remote-poll');
     }, REMOTE_CHECK_SECS * 1000);
     await scheduleNextDueWake();
   })
